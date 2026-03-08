@@ -402,4 +402,3 @@ func TestSessionAffinityWithConfig(t *testing.T) {
 	}
 }
 
-// Made with Bob

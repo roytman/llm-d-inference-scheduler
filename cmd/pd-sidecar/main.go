@@ -39,25 +39,35 @@ const (
 )
 
 var (
-	// supportedConnectors defines all valid P/D connector types
-	supportedConnectors = []string{
-		proxy.ConnectorNIXLV2,
-		proxy.ConnectorSharedStorage,
-		proxy.ConnectorSGLang,
+	// supportedKVConnectors defines all valid P/D KV connector types
+	supportedKVConnectors = map[string]struct{}{
+		proxy.ConnectorNIXLV2:        {},
+		proxy.ConnectorSharedStorage: {},
+		proxy.ConnectorSGLang:        {},
 	}
 
 	// supportedTLSStages defines all valid stages for TLS configuration
-	supportedTLSStages = map[string]bool{
-		prefillStage: true,
-		decodeStage:  true,
+	supportedTLSStages = map[string]struct{}{
+		prefillStage: {},
+		decodeStage:  {},
 	}
 )
 
 // supportedTLSStagesNames returns a slice of supported TLS stage names
 func supportedTLSStagesNames() []string {
-	names := make([]string, 0, len(supportedTLSStages))
-	for stage := range supportedTLSStages {
-		names = append(names, stage)
+	return supportedNames(supportedTLSStages)
+}
+
+// supportedKVConnectorsNames returns a slice of supported KV connector names
+func supportedKVConnectorsNames() []string {
+	return supportedNames(supportedKVConnectors)
+}
+
+// supportedNames returns a slice of supported names from the given map[string]struct{}
+func supportedNames(aMap map[string]struct{}) []string {
+	names := make([]string, 0, len(aMap))
+	for name := range aMap {
+		names = append(names, name)
 	}
 	return names
 }
@@ -76,7 +86,7 @@ func main() {
 	port := pflag.String("port", "8000", "the port the sidecar is listening on")
 	vLLMPort := pflag.String("vllm-port", "8001", "the port vLLM is listening on")
 	vLLMDataParallelSize := pflag.Int("data-parallel-size", 1, "the vLLM DATA-PARALLEL-SIZE value")
-	connector := pflag.String("connector", proxy.ConnectorNIXLV2, "the P/D connector being used. Supported: "+strings.Join(supportedConnectors, ", "))
+	connector := pflag.String("connector", proxy.ConnectorNIXLV2, "the P/D KV connector being used. Supported: "+strings.Join(supportedKVConnectorsNames(), ", "))
 	enableTLS := pflag.StringSlice("enable-tls", []string{}, "stages to enable TLS for. Supported: "+strings.Join(supportedTLSStagesNames(), ", ")+". Can be specified multiple times or as comma-separated values.")
 	tlsInsecureSkipVerify := pflag.StringSlice("tls-insecure-skip-verify", []string{}, "stages to skip TLS verification for. Supported: "+strings.Join(supportedTLSStagesNames(), ", ")+". Can be specified multiple times or as comma-separated values.")
 	secureProxy := pflag.Bool("secure-proxy", true, "Enables secure proxy. Defaults to true.")
@@ -119,30 +129,23 @@ func main() {
 
 	logger.Info("Proxy starting", "Built on", version.BuildRef, "From Git SHA", version.CommitSHA)
 
-	// Validate connector
-	isValidConnector := false
-	for _, validConnector := range supportedConnectors {
-		if *connector == validConnector {
-			isValidConnector = true
-			break
-		}
-	}
-	if !isValidConnector {
-		logger.Info("Error: --connector must be one of: " + strings.Join(supportedConnectors, ", "))
+	// Validate KV connector
+	if _, ok := supportedKVConnectors[*connector]; !ok {
+		logger.Info("Error: --connector must be one of: " + strings.Join(supportedKVConnectorsNames(), ", "))
 		return
 	}
-	logger.Info("p/d connector validated", "connector", connector)
+	logger.Info("p/d KV connector validated", "connector", connector)
 
 	// Validate TLS stages
 	for _, stage := range *enableTLS {
-		if !supportedTLSStages[stage] {
+		if _, ok := supportedTLSStages[stage]; !ok {
 			logger.Info("Error: --enable-tls stages must be one of: " + strings.Join(supportedTLSStagesNames(), ", "))
 			return
 		}
 	}
 
 	for _, stage := range *tlsInsecureSkipVerify {
-		if !supportedTLSStages[stage] {
+		if _, ok := supportedTLSStages[stage]; !ok {
 			logger.Info("Error: --tls-insecure-skip-verify stages must be one of: " + strings.Join(supportedTLSStagesNames(), ", "))
 			return
 		}

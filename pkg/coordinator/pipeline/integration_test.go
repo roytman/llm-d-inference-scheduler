@@ -37,10 +37,16 @@ func TestFullPipeline_Integration(t *testing.T) {
 	gatewayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/encode"):
+			body, _ := io.ReadAll(r.Body)
+			var parsed map[string]any
+			_ = json.Unmarshal(body, &parsed)
+			features, _ := parsed["features"].(map[string]any)
+			mmHashes, _ := features["mm_hashes"].(map[string]any)
+			imageHashes, _ := mmHashes["image"].([]any)
+			hash, _ := imageHashes[0].(string)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"ec_transfer_params": map[string]any{
-					"peer_host": "10.0.0.1",
-					"peer_port": 5501,
+					hash: map[string]any{"peer_host": "10.0.0.1", "peer_port": 5501},
 				},
 			})
 		case strings.HasPrefix(r.URL.Path, "/prefill"):
@@ -71,8 +77,8 @@ func TestFullPipeline_Integration(t *testing.T) {
 	stepConfigs := []config.StepConfig{
 		{Type: "replace-media-urls", Params: map[string]any{"download_timeout": "5s"}},
 		{Type: "render", Params: map[string]any{"endpoint": "/v1/chat/completions/render"}},
-		{Type: "encode", Params: map[string]any{"gateway_path": "/inference/v1/generate"}},
-		{Type: "prefill", Params: map[string]any{"gateway_path": "/inference/v1/generate"}},
+		{Type: "encode", Params: map[string]any{"gateway_path": "/inference/v1/generate", "ec_connector": "nixlv2"}},
+		{Type: "prefill", Params: map[string]any{"gateway_path": "/inference/v1/generate", "ec_connector": "nixlv2"}},
 		{Type: "decode", Params: map[string]any{}},
 	}
 

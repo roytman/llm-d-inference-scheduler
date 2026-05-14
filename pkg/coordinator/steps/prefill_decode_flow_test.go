@@ -68,7 +68,7 @@ func TestKVTransferParams_FlowFromPrefillToDecode(t *testing.T) {
 			{Index: 0, Hash: "hash-1", Placeholder: pipeline.PlaceholderRange{Offset: 1, Length: 3}},
 		},
 		ECTransferParams: []map[string]any{
-			{"peer_host": "10.0.0.1", "peer_port": 5501},
+			{"hash-1": map[string]any{"peer_host": "10.0.0.1", "peer_port": 5501}},
 		},
 		KVTransferParams: make(map[string]any),
 		Body: map[string]any{

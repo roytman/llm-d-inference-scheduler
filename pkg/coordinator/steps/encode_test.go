@@ -46,10 +46,17 @@ func TestEncodeStep_ParallelFanOut(t *testing.T) {
 			t.Errorf("expected 1 kwargs_data per encode request, got %d", len(imageKwargs))
 		}
 
+		// Echo the per-image hash back as the ec_transfer_params key, matching
+		// the real encoder shape: {mm_hash: {peer_host, peer_port, ...}}.
+		hash, _ := imageHashes[0].(string)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ec_transfer_params": map[string]any{
-				"peer_host": "10.0.0.1",
-				"peer_port": 5501,
+				hash: map[string]any{
+					"peer_host":               "10.0.0.1",
+					"peer_port":               5501,
+					"size_bytes":              2359296,
+					"nixl_agent_metadata_b64": "TklYTA==",
+				},
 			},
 		})
 	}))
@@ -60,6 +67,7 @@ func TestEncodeStep_ParallelFanOut(t *testing.T) {
 	step, err := NewEncodeStep(map[string]any{
 		"gateway_path": "/inference/v1/generate",
 		"max_parallel": 4,
+		"ec_connector": "nixlv2",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -89,9 +97,25 @@ func TestEncodeStep_ParallelFanOut(t *testing.T) {
 		t.Fatalf("expected 3 ec_transfer_params entries, got %d", len(reqCtx.ECTransferParams))
 	}
 
-	for i, param := range reqCtx.ECTransferParams {
-		if param["peer_host"] != "10.0.0.1" {
-			t.Fatalf("entry %d: unexpected peer_host: %v", i, param["peer_host"])
+	seen := make(map[string]bool)
+	for i, entry := range reqCtx.ECTransferParams {
+		if len(entry) != 1 {
+			t.Fatalf("entry %d: expected single-key map, got %d keys: %v", i, len(entry), entry)
+		}
+		for hash, param := range entry {
+			seen[hash] = true
+			paramMap, ok := param.(map[string]any)
+			if !ok {
+				t.Fatalf("entry %s: not a map: %T", hash, param)
+			}
+			if paramMap["peer_host"] != "10.0.0.1" {
+				t.Fatalf("entry %s: unexpected peer_host: %v", hash, paramMap["peer_host"])
+			}
+		}
+	}
+	for _, want := range []string{"hash-a", "hash-b", "hash-c"} {
+		if !seen[want] {
+			t.Errorf("missing key %q in merged ECTransferParams: %v", want, reqCtx.ECTransferParams)
 		}
 	}
 }

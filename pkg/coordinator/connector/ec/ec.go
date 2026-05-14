@@ -1,0 +1,56 @@
+// Package ec contains EC (encoder cache) transfer connector implementations
+// selected at config time. Each connector controls how encoder pods hand off
+// embeddings to the prefill consumer pod.
+package ec
+
+import (
+	"fmt"
+
+	"github.com/llm-d/coordinator/pkg/connector"
+	"github.com/llm-d/coordinator/pkg/pipeline"
+)
+
+// Connector controls how encoder cache (vision encoder embeddings) is
+// transferred from encoder pods to the prefill consumer pod. Two flavors:
+//
+//   - nixl: encoder pods register embeddings in NIXL-mapped memory and return
+//     {mm_hash: {peer_host, peer_port, size_bytes, nixl_agent_metadata_b64}}
+//     per encoded image. The coordinator merges these by mm_hash and forwards
+//     them to the prefill request as ec_transfer_params.
+//   - shared_storage: encoder pods write embeddings to shared storage keyed
+//     by mm_hash. The consumer reads them back; no ec_transfer_params needed
+//     on the wire.
+//
+// EC connector selection is independent of the KV connector — a deployment
+// can pair nixl-EC with shared_storage-KV, etc.
+type Connector interface {
+	Name() string
+	// MergeEncodeResponse incorporates one encoder response into
+	// reqCtx.ECTransferParams. Called once per encoder sub-request.
+	// Implementations must be safe for non-concurrent calls (the caller
+	// merges sequentially after gathering responses in parallel).
+	MergeEncodeResponse(reqCtx *pipeline.RequestContext, encResp map[string]any)
+	// PreparePrefillECParams returns the ec_transfer_params map for the
+	// prefill request body. A nil/empty return means no ec_transfer_params
+	// field should be emitted.
+	PreparePrefillECParams(reqCtx *pipeline.RequestContext) map[string]any
+}
+
+// DefaultName is the EC connector name selected when an empty string is
+// passed to Build. Defaults to shared_storage (no-op on the wire).
+const DefaultName = connector.NameSharedStorage
+
+// Build returns the named EC connector. An empty name selects DefaultName.
+func Build(name string) (Connector, error) {
+	if name == "" {
+		name = DefaultName
+	}
+	switch name {
+	case connector.NameNIXLv2:
+		return nixlV2{}, nil
+	case connector.NameSharedStorage:
+		return sharedStorage{}, nil
+	default:
+		return nil, fmt.Errorf("unknown ec_connector: %q", name)
+	}
+}

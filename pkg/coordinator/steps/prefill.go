@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 
+	"github.com/llm-d/coordinator/pkg/connector/ec"
+	"github.com/llm-d/coordinator/pkg/connector/kv"
 	"github.com/llm-d/coordinator/pkg/gateway"
 	"github.com/llm-d/coordinator/pkg/pipeline"
 )
@@ -18,6 +20,8 @@ func init() {
 type PrefillStep struct {
 	gatewayPath string
 	gwClient    *gateway.Client
+	kv          kv.Connector
+	ec          ec.Connector
 }
 
 func NewPrefillStep(params map[string]any) (pipeline.Step, error) {
@@ -25,7 +29,17 @@ func NewPrefillStep(params map[string]any) (pipeline.Step, error) {
 	if v, ok := params["gateway_path"].(string); ok {
 		path = v
 	}
-	return &PrefillStep{gatewayPath: path}, nil
+	kvName, _ := params["kv_connector"].(string)
+	kvConn, err := kv.Build(kvName)
+	if err != nil {
+		return nil, fmt.Errorf("prefill: %w", err)
+	}
+	ecName, _ := params["ec_connector"].(string)
+	ecConn, err := ec.Build(ecName)
+	if err != nil {
+		return nil, fmt.Errorf("prefill: %w", err)
+	}
+	return &PrefillStep{gatewayPath: path, kv: kvConn, ec: ecConn}, nil
 }
 
 func (s *PrefillStep) SetGatewayClient(c *gateway.Client) {
@@ -59,14 +73,14 @@ func (s *PrefillStep) Execute(ctx context.Context, reqCtx *pipeline.RequestConte
 		"token_ids":          reqCtx.TokenIDs,
 		"model":              reqCtx.Model,
 		"sampling_params":    map[string]any{"max_tokens": 1},
-		"kv_transfer_params": map[string]any{"do_remote_decode": true},
+		"kv_transfer_params": s.kv.PreparePrefillKVParams(reqCtx),
 	}
 
 	if features != nil {
 		body["features"] = features
 	}
-	if len(reqCtx.ECTransferParams) > 0 {
-		body["ec_transfer_params"] = map[string]any{"image": reqCtx.ECTransferParams}
+	if ecParams := s.ec.PreparePrefillECParams(reqCtx); len(ecParams) > 0 {
+		body["ec_transfer_params"] = ecParams
 	}
 
 	bodyBytes, err := json.Marshal(body)

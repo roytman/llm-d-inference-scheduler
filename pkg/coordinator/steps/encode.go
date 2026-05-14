@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 
+	"github.com/llm-d/coordinator/pkg/connector/ec"
 	"github.com/llm-d/coordinator/pkg/gateway"
 	"github.com/llm-d/coordinator/pkg/pipeline"
 	"golang.org/x/sync/errgroup"
@@ -20,6 +21,7 @@ type EncodeStep struct {
 	gatewayPath string
 	maxParallel int
 	gwClient    *gateway.Client
+	ec          ec.Connector
 }
 
 func NewEncodeStep(params map[string]any) (pipeline.Step, error) {
@@ -34,9 +36,15 @@ func NewEncodeStep(params map[string]any) (pipeline.Step, error) {
 		}
 		maxParallel = v
 	}
+	ecName, _ := params["ec_connector"].(string)
+	ecConn, err := ec.Build(ecName)
+	if err != nil {
+		return nil, fmt.Errorf("encode: %w", err)
+	}
 	return &EncodeStep{
 		gatewayPath: path,
 		maxParallel: maxParallel,
+		ec:          ecConn,
 	}, nil
 }
 
@@ -105,9 +113,11 @@ func (s *EncodeStep) Execute(ctx context.Context, reqCtx *pipeline.RequestContex
 		return err
 	}
 
-	reqCtx.ECTransferParams = results
+	for _, r := range results {
+		s.ec.MergeEncodeResponse(reqCtx, r)
+	}
 
-	slog.Info("encode: all sub-requests complete", "count", len(results))
+	slog.Info("encode: all sub-requests complete", "count", len(results), "merged_hashes", len(reqCtx.ECTransferParams))
 	return nil
 }
 

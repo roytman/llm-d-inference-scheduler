@@ -42,10 +42,25 @@ func main() {
 	}
 }
 
+func mergeConnectorDefaults(params map[string]any, kvConnector, ecConnector string) map[string]any {
+	out := make(map[string]any, len(params))
+	for k, v := range params {
+		out[k] = v
+	}
+	if _, ok := out["kv_connector"]; !ok && kvConnector != "" {
+		out["kv_connector"] = kvConnector
+	}
+	if _, ok := out["ec_connector"]; !ok && ecConnector != "" {
+		out["ec_connector"] = ecConnector
+	}
+	return out
+}
+
 func buildPipeline(cfg *config.Config, gwClient *gateway.Client) ([]pipeline.Step, error) {
 	var steps []pipeline.Step
 	for _, stepCfg := range cfg.Pipeline.Steps {
-		step, err := pipeline.Build(stepCfg.Type, stepCfg.Params)
+		params := mergeConnectorDefaults(stepCfg.Params, cfg.Pipeline.KVConnector, cfg.Pipeline.ECConnector)
+		step, err := pipeline.Build(stepCfg.Type, params)
 		if err != nil {
 			return nil, err
 		}

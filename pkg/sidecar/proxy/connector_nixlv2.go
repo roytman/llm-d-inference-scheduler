@@ -17,37 +17,27 @@ limitations under the License.
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/llm-d/llm-d-inference-scheduler/pkg/telemetry"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/llm-d/llm-d-router/pkg/telemetry"
 )
 
-func (s *Server) runNIXLProtocolV2(w http.ResponseWriter, r *http.Request, prefillPodHostPort string) {
-	s.logger.V(4).Info("running NIXL protocol V2", "url", prefillPodHostPort)
+func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPodHostPort string, apiType APIType) {
+	tokenLimitFields := tokenLimitFieldsForAPIType(apiType)
+	s.logger.V(4).Info("running NIXL protocol V2", "url", prefillPodHostPort, "tokenLimitFields", tokenLimitFields)
 
-	// Read request body
-	defer r.Body.Close() //nolint:all
-	original, err := io.ReadAll(r.Body)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest) // TODO: check FastAPI error code when failing to read body
-		w.Write([]byte(err.Error()))         //nolint:all
-		return
-	}
-
-	// Parse completion request
-	var completionRequest map[string]any
-	if err := json.Unmarshal(original, &completionRequest); err != nil {
-		if err := errorJSONInvalid(err, w); err != nil {
-			s.logger.Error(err, "failed to send error response to client")
-		}
+	original, completionRequest, ok := s.readJSONBody(r, w)
+	if !ok {
 		return
 	}
 
@@ -71,7 +61,7 @@ func (s *Server) runNIXLProtocolV2(w http.ResponseWriter, r *http.Request, prefi
 	prefillSpan.SetAttributes(
 		attribute.String("llm_d.pd_proxy.request_id", uuidStr),
 		attribute.String("llm_d.pd_proxy.prefill_target", prefillPodHostPort),
-		attribute.String("llm_d.pd_proxy.connector", "nixlv2"),
+		attribute.String("llm_d.pd_proxy.connector", KVConnectorNIXLV2),
 	)
 	prefillStart := time.Now()
 
@@ -80,10 +70,28 @@ func (s *Server) runNIXLProtocolV2(w http.ResponseWriter, r *http.Request, prefi
 
 	preq.Header.Add(requestHeaderRequestID, uuidStr)
 
+	// Save original values based on API type
 	streamValue, streamOk := completionRequest[requestFieldStream]
 	streamOptionsValue, streamOptionsOk := completionRequest[requestFieldStreamOptions]
-	maxTokensValue, maxTokensOk := completionRequest[requestFieldMaxTokens]
-	maxCompletionTokensValue, maxCompletionTokensOk := completionRequest[requestFieldMaxCompletionTokens]
+
+	// Save and override token limit fields for prefill
+	type savedField struct {
+		field   string
+		val     any
+		present bool
+	}
+	var savedTokenValues [2]savedField
+	for i, field := range tokenLimitFields {
+		if v, ok := completionRequest[field]; ok {
+			savedTokenValues[i] = savedField{field: field, val: v, present: true}
+		} else {
+			savedTokenValues[i] = savedField{field: field}
+		}
+	}
+
+	// Snapshot the original request map before prefill mutations so the
+	// fallback-to-decode path can dispatch with the correct original fields.
+	originalRequest := maps.Clone(completionRequest)
 
 	completionRequest[requestFieldKVTransferParams] = map[string]any{
 		requestFieldDoRemoteDecode:  true,
@@ -96,8 +104,10 @@ func (s *Server) runNIXLProtocolV2(w http.ResponseWriter, r *http.Request, prefi
 
 	completionRequest[requestFieldStream] = false
 	delete(completionRequest, requestFieldStreamOptions)
-	completionRequest[requestFieldMaxTokens] = 1
-	completionRequest[requestFieldMaxCompletionTokens] = 1
+
+	for _, field := range tokenLimitFields {
+		completionRequest[field] = 1
+	}
 
 	pbody, err := json.Marshal(completionRequest)
 	if err != nil {
@@ -106,7 +116,7 @@ func (s *Server) runNIXLProtocolV2(w http.ResponseWriter, r *http.Request, prefi
 		}
 		return
 	}
-	preq.Body = io.NopCloser(strings.NewReader(string(pbody)))
+	preq.Body = io.NopCloser(bytes.NewReader(pbody))
 	preq.ContentLength = int64(len(pbody))
 
 	prefillHandler, err := s.prefillerProxyHandler(prefillPodHostPort)
@@ -136,8 +146,8 @@ func (s *Server) runNIXLProtocolV2(w http.ResponseWriter, r *http.Request, prefi
 
 		if shouldFallbackToDecode(pw) {
 			s.logger.Info("fallback to decode", "request_id", uuidStr)
-			r.Body = io.NopCloser(strings.NewReader(string(original)))
-			s.decoderProxy.ServeHTTP(w, r)
+			fallbackReq := cloneRequestWithBody(r.Context(), r, original)
+			s.dispatchDecode(w, fallbackReq, originalRequest)
 		} else {
 			for key, values := range pw.Header() {
 				for _, v := range values {
@@ -145,7 +155,7 @@ func (s *Server) runNIXLProtocolV2(w http.ResponseWriter, r *http.Request, prefi
 				}
 			}
 			w.WriteHeader(pw.statusCode)
-			_, err := w.Write([]byte(pw.buffer.String()))
+			_, err := w.Write(pw.bodyBytes())
 			if err != nil {
 				s.logger.Error(err, "failed to send error response to client")
 			}
@@ -156,7 +166,7 @@ func (s *Server) runNIXLProtocolV2(w http.ResponseWriter, r *http.Request, prefi
 
 	// Process response - extract p/d fields
 	var prefillerResponse map[string]any
-	if err := json.Unmarshal([]byte(pw.buffer.String()), &prefillerResponse); err != nil {
+	if err := json.Unmarshal(pw.bodyBytes(), &prefillerResponse); err != nil {
 		if err := errorJSONInvalid(err, w); err != nil {
 			s.logger.Error(err, "failed to send error response to client")
 		}
@@ -168,6 +178,12 @@ func (s *Server) runNIXLProtocolV2(w http.ResponseWriter, r *http.Request, prefi
 	pKVTransferParams, ok := prefillerResponse[requestFieldKVTransferParams]
 	if !ok {
 		s.logger.Info("warning: missing 'kv_transfer_params' field in prefiller response")
+	}
+	pCachedTokens, hasPCachedTokens := extractCachedTokens(prefillerResponse)
+	if !hasPCachedTokens {
+		// vLLM returns prompt_tokens_details as null when cached_tokens is 0,
+		// so treat a missing prefiller cached_tokens value as zero.
+		pCachedTokens = 0
 	}
 
 	s.logger.V(5).Info("received prefiller response", requestFieldKVTransferParams, pKVTransferParams)
@@ -181,7 +197,7 @@ func (s *Server) runNIXLProtocolV2(w http.ResponseWriter, r *http.Request, prefi
 
 	decodeSpan.SetAttributes(
 		attribute.String("llm_d.pd_proxy.request_id", uuidStr),
-		attribute.String("llm_d.pd_proxy.connector", "nixlv2"),
+		attribute.String("llm_d.pd_proxy.connector", KVConnectorNIXLV2),
 	)
 	decodeStart := time.Now()
 
@@ -202,14 +218,15 @@ func (s *Server) runNIXLProtocolV2(w http.ResponseWriter, r *http.Request, prefi
 	if streamOptionsOk {
 		completionRequest[requestFieldStreamOptions] = streamOptionsValue
 	}
-	delete(completionRequest, requestFieldMaxTokens)
-	if maxTokensOk {
-		completionRequest[requestFieldMaxTokens] = maxTokensValue
+
+	for i := range savedTokenValues[:len(tokenLimitFields)] {
+		sv := &savedTokenValues[i]
+		delete(completionRequest, sv.field)
+		if sv.present {
+			completionRequest[sv.field] = sv.val
+		}
 	}
-	delete(completionRequest, requestFieldMaxCompletionTokens)
-	if maxCompletionTokensOk {
-		completionRequest[requestFieldMaxCompletionTokens] = maxCompletionTokensValue
-	}
+
 	completionRequest[requestFieldKVTransferParams] = pKVTransferParams
 
 	dbody, err := json.Marshal(completionRequest)
@@ -219,19 +236,25 @@ func (s *Server) runNIXLProtocolV2(w http.ResponseWriter, r *http.Request, prefi
 		}
 		return
 	}
-	dreq.Body = io.NopCloser(strings.NewReader(string(dbody)))
+	dreq.Body = io.NopCloser(bytes.NewReader(dbody))
 	dreq.ContentLength = int64(len(dbody))
 
 	// 2. Forward to local decoder.
 
 	s.logger.V(5).Info("sending request to decoder", "body", string(dbody))
-	dataParallelUsed := s.forwardDataParallel && s.dataParallelHandler(w, dreq)
+	decodeWriter, finalizeDecodeWriter := newCachedTokensResponseWriterWithFinalize(w, pCachedTokens)
+	dataParallelUsed := s.forwardDataParallel && s.dataParallelHandler(decodeWriter, dreq)
 	decodeSpan.SetAttributes(attribute.Bool("llm_d.pd_proxy.decode.data_parallel", dataParallelUsed))
 
 	if !dataParallelUsed {
 		s.logger.V(4).Info("sending request to decoder", "to", s.config.DecoderURL.Host)
 		decodeSpan.SetAttributes(attribute.String("llm_d.pd_proxy.decode.target", s.config.DecoderURL.Host))
-		s.decoderProxy.ServeHTTP(w, dreq)
+		s.dispatchDecode(decodeWriter, dreq, completionRequest)
+	}
+	if err := finalizeDecodeWriter(); err != nil {
+		s.logger.Error(err, "failed to flush cached token response writer")
+		decodeSpan.SetStatus(codes.Error, "failed to flush cached token response writer")
+		return
 	}
 
 	decodeDuration := time.Since(decodeStart)

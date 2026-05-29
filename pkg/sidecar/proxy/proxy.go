@@ -20,36 +20,45 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"math/rand"
+	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"golang.org/x/sync/errgroup"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/llm-d/llm-d-router/pkg/sidecar/constants"
 )
 
 const (
 	schemeHTTPS = "https"
 
+	defaultMaxIdleConnsPerHost = 1024
+
 	requestHeaderRequestID = "x-request-id"
 
-	requestFieldKVTransferParams    = "kv_transfer_params"
-	requestFieldMaxTokens           = "max_tokens"
-	requestFieldMaxCompletionTokens = "max_completion_tokens"
-	requestFieldDoRemotePrefill     = "do_remote_prefill"
-	requestFieldDoRemoteDecode      = "do_remote_decode"
-	requestFieldRemoteBlockIDs      = "remote_block_ids"
-	requestFieldRemoteEngineID      = "remote_engine_id"
-	requestFieldRemoteHost          = "remote_host"
-	requestFieldRemotePort          = "remote_port"
-	requestFieldStream              = "stream"
-	requestFieldStreamOptions       = "stream_options"
-	requestFieldCacheHitThreshold   = "cache_hit_threshold"
+	requestFieldKVTransferParams     = "kv_transfer_params"
+	requestFieldMaxTokens            = "max_tokens"
+	requestFieldMaxCompletionTokens  = "max_completion_tokens"
+	requestFieldMaxOutputTokens      = "max_output_tokens" // Used by Responses API
+	requestFieldDoRemotePrefill      = "do_remote_prefill"
+	requestFieldDoRemoteDecode       = "do_remote_decode"
+	requestFieldRemoteBlockIDs       = "remote_block_ids"
+	requestFieldRemoteEngineID       = "remote_engine_id"
+	requestFieldRemoteHost           = "remote_host"
+	requestFieldRemotePort           = "remote_port"
+	requestFieldStream               = "stream"
+	requestFieldStreamOptions        = "stream_options"
+	requestFieldCacheHitThreshold    = "cache_hit_threshold"
+	requestFieldContinueFinalMessage = "continue_final_message"
+	requestFieldAddGenerationPrompt  = "add_generation_prompt"
 
 	responseFieldChoices      = "choices"
 	responseFieldFinishReason = "finish_reason"
@@ -61,23 +70,53 @@ const (
 	requestFieldBootstrapPort = "bootstrap_port"
 	requestFieldBootstrapRoom = "bootstrap_room"
 
-	// KVConnectorNIXLV2 enables the P/D KV NIXL v2 protocol
-	KVConnectorNIXLV2 = "nixlv2"
-
-	// KVConnectorSharedStorage enables the P/D KV Shared Storage protocol
-	KVConnectorSharedStorage = "shared-storage"
-
-	// KVConnectorSGLang enables SGLang the P/D KV disaggregation protocol
-	KVConnectorSGLang = "sglang"
-
-	// ECExampleConnector enables the Encoder disaggregation protocol (E/PD, E/P/D)
-	ECExampleConnector = "ec-example"
-
-	// DefaultPoolGroup is the default pool group name
-	DefaultPoolGroup = "inference.networking.k8s.io"
-	// LegacyPoolGroup is the legacy pool group name
-	LegacyPoolGroup = "inference.networking.x-k8s.io"
+	KVConnectorNIXLV2        = constants.KVConnectorNIXLV2
+	KVConnectorSharedStorage = constants.KVConnectorSharedStorage
+	KVConnectorSGLang        = constants.KVConnectorSGLang
+	ECExampleConnector       = constants.ECExampleConnector
+	DefaultPoolGroup         = constants.DefaultPoolGroup
+	LegacyPoolGroup          = constants.LegacyPoolGroup
 )
+
+// APIType represents the type of OpenAI API being used.
+type APIType int
+
+const (
+	// APITypeChatCompletions is the Chat Completions API (/v1/chat/completions, /v1/completions)
+	APITypeChatCompletions APIType = iota
+	// APITypeResponses is the Responses API (/v1/responses)
+	APITypeResponses
+)
+
+// String implements fmt.Stringer so structured logs show readable API names.
+func (a APIType) String() string {
+	switch a {
+	case APITypeChatCompletions:
+		return "chat_completions"
+	case APITypeResponses:
+		return "responses"
+	default:
+		return fmt.Sprintf("APIType(%d)", int(a))
+	}
+}
+
+// JSON request field names used for token limits in prefill/decode staging.
+// Do not mutate these slices.
+var (
+	chatCompletionTokenLimitFields = []string{requestFieldMaxTokens, requestFieldMaxCompletionTokens}
+	responsesStyleTokenLimitFields = []string{requestFieldMaxOutputTokens}
+)
+
+// tokenLimitFieldsForAPIType returns token limit field names for the given API.
+// Returned slices are shared package-level vars; callers must not mutate them.
+func tokenLimitFieldsForAPIType(api APIType) []string {
+	switch api {
+	case APITypeResponses:
+		return responsesStyleTokenLimitFields
+	default:
+		return chatCompletionTokenLimitFields
+	}
+}
 
 // Config represents the complete runtime configuration for the proxy server.
 type Config struct {
@@ -93,6 +132,12 @@ type Config struct {
 	ECConnector string
 	// DataParallelSize is the value passed to the vLLM server's --DATA_PARALLEL-SIZE argument.
 	DataParallelSize int
+
+	// MaxIdleConnsPerHost controls how many idle keep-alive connections are
+	// maintained per host for the reverse proxy transports. Set this to at
+	// least the expected concurrency level to avoid connection churn.
+	MaxIdleConnsPerHost int
+
 	// EnablePrefillerSampling configures the proxy to randomly choose from the set
 	// of provided prefill hosts instead of always using the first one.
 	EnablePrefillerSampling bool
@@ -123,6 +168,10 @@ type Config struct {
 	InferencePoolName string
 	// PoolGroup is the API group of the InferencePool resource.
 	PoolGroup string
+
+	// DecodeChunkSize is the token budget per decode chunk.
+	// Chunked decode is enabled when this value is > 0.
+	DecodeChunkSize int
 }
 
 // MarshalJSON implements json.Marshaler for Config.
@@ -150,20 +199,23 @@ func (c Config) String() string {
 	return string(b)
 }
 
-type protocolRunner func(http.ResponseWriter, *http.Request, string)
-type epdProtocolRunner func(http.ResponseWriter, *http.Request, string, []string)
+// pdConnectorHandler handles a P/D KV connector request. The APIType lets each
+// connector decide internally which JSON fields (if any) need special handling.
+type pdConnectorHandler func(http.ResponseWriter, *http.Request, string, APIType)
+
+type epdConnectorHandler func(http.ResponseWriter, *http.Request, string, []string)
 
 // Server is the reverse proxy server
 type Server struct {
-	logger                  logr.Logger
-	addr                    net.Addr      // the proxy TCP address
-	readyCh                 chan struct{} // closed once addr is set and server is listening
-	handler                 http.Handler  // the handler function. either a Mux or a proxy
-	allowlistValidator      *AllowlistValidator
-	runPDConnectorProtocol  protocolRunner    // the handler for running the Prefiller-Decoder protocol
-	runEPDConnectorProtocol epdProtocolRunner // the handler for running the Encoder-Prefiller-Decoder protocol
-	prefillerURLPrefix      string
-	encoderURLPrefix        string
+	logger             logr.Logger
+	addr               net.Addr      // the proxy TCP address
+	readyCh            chan struct{} // closed once addr is set and server is listening
+	handler            http.Handler  // the handler function. either a Mux or a proxy
+	allowlistValidator *AllowlistValidator
+	handlePDConnector  pdConnectorHandler  // handles the Prefiller-Decoder connector request
+	handleEPDConnector epdConnectorHandler // handles the Encoder-Prefiller-Decoder connector request
+	prefillerURLPrefix string
+	encoderURLPrefix   string
 
 	decoderProxy        http.Handler                     // decoder proxy handler
 	prefillerProxies    *lru.Cache[string, http.Handler] // cached prefiller proxy handlers
@@ -178,8 +230,8 @@ type Server struct {
 
 // NewProxy creates a new routing reverse proxy from the given Config.
 func NewProxy(config Config) *Server {
-	prefillerCache, _ := lru.New[string, http.Handler](16) // nolint:all
-	encoderCache, _ := lru.New[string, http.Handler](16)   // nolint:all
+	prefillerCache, _ := lru.New[string, http.Handler](1024) // nolint:errcheck
+	encoderCache, _ := lru.New[string, http.Handler](1024)   // nolint:errcheck
 
 	server := &Server{
 		readyCh:             make(chan struct{}),
@@ -190,7 +242,7 @@ func NewProxy(config Config) *Server {
 		config:              config,
 		dataParallelProxies: map[string]http.Handler{},
 		forwardDataParallel: true,
-		prefillSamplerFn:    rand.Intn,
+		prefillSamplerFn:    rand.IntN,
 	}
 
 	server.setKVConnector()
@@ -246,34 +298,68 @@ func (s *Server) Start(ctx context.Context) error {
 // always set them explicitly after cloning.
 func (s *Server) Clone() *Server {
 	return &Server{
-		addr:                    s.addr,
-		readyCh:                 make(chan struct{}),
-		handler:                 s.handler,
-		allowlistValidator:      s.allowlistValidator,
-		runPDConnectorProtocol:  s.runPDConnectorProtocol,
-		runEPDConnectorProtocol: s.runEPDConnectorProtocol,
-		prefillerURLPrefix:      s.prefillerURLPrefix,
-		encoderURLPrefix:        s.encoderURLPrefix,
-		prefillerProxies:        s.prefillerProxies,
-		encoderProxies:          s.encoderProxies,
-		dataParallelProxies:     s.dataParallelProxies,
-		forwardDataParallel:     s.forwardDataParallel,
-		prefillSamplerFn:        s.prefillSamplerFn,
-		config:                  s.config,
+		addr:                s.addr,
+		readyCh:             make(chan struct{}),
+		handler:             s.handler,
+		allowlistValidator:  s.allowlistValidator,
+		handlePDConnector:   s.handlePDConnector,
+		handleEPDConnector:  s.handleEPDConnector,
+		prefillerURLPrefix:  s.prefillerURLPrefix,
+		encoderURLPrefix:    s.encoderURLPrefix,
+		prefillerProxies:    s.prefillerProxies,
+		encoderProxies:      s.encoderProxies,
+		dataParallelProxies: s.dataParallelProxies,
+		forwardDataParallel: s.forwardDataParallel,
+		prefillSamplerFn:    s.prefillSamplerFn,
+		config:              s.config,
 	}
+}
+
+// newProxyTransport returns an http.Transport cloned from the default with
+// connection-pool settings applied. If scheme is schemeHTTPS the transport's
+// TLSClientConfig is set accordingly.
+func (s *Server) newProxyTransport(scheme string, insecureSkipVerify bool) *http.Transport {
+	maxIdle := s.config.MaxIdleConnsPerHost
+	if maxIdle <= 0 {
+		maxIdle = defaultMaxIdleConnsPerHost
+	}
+	t := http.DefaultTransport.(*http.Transport).Clone() //nolint:errcheck
+	t.MaxIdleConns = 0                                   // unlimited
+	t.MaxIdleConnsPerHost = maxIdle
+	t.MaxConnsPerHost = 0 // unlimited
+	t.IdleConnTimeout = 90 * time.Second
+	if scheme == schemeHTTPS {
+		t.TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: insecureSkipVerify, //nolint:gosec
+			MinVersion:         tls.VersionTLS12,
+			CipherSuites: []uint16{
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+			},
+		}
+	}
+	return t
 }
 
 func (s *Server) setKVConnector() {
 
 	switch s.config.KVConnector {
 	case KVConnectorSharedStorage:
-		s.runPDConnectorProtocol = s.runSharedStorageProtocol
+		s.handlePDConnector = func(w http.ResponseWriter, r *http.Request, host string, _ APIType) {
+			s.handleSharedStorage(w, r, host)
+		}
 	case KVConnectorSGLang:
-		s.runPDConnectorProtocol = s.runSGLangProtocol
+		s.handlePDConnector = func(w http.ResponseWriter, r *http.Request, host string, _ APIType) {
+			s.handleSGLang(w, r, host)
+		}
 	case KVConnectorNIXLV2:
 		fallthrough
 	default:
-		s.runPDConnectorProtocol = s.runNIXLProtocolV2
+		s.handlePDConnector = s.handleNIXLV2
 	}
 }
 
@@ -287,7 +373,7 @@ func (s *Server) setECConnector() {
 
 	switch ecConnector {
 	case ECExampleConnector:
-		s.runEPDConnectorProtocol = s.runEPDProtocol
+		s.handleEPDConnector = s.handleEPD
 	default:
 		// Unknown EC connector value, skip encoder stage
 		return
@@ -302,8 +388,9 @@ func (s *Server) createRoutes() *http.ServeMux {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	mux.HandleFunc("POST "+ChatCompletionsPath, s.chatCompletionsHandler) // /v1/chat/completions (openai)
-	mux.HandleFunc("POST "+CompletionsPath, s.chatCompletionsHandler)     // /v1/completions (legacy)
+	mux.HandleFunc("POST "+ChatCompletionsPath, s.disaggregatedPrefillHandler(APITypeChatCompletions))
+	mux.HandleFunc("POST "+CompletionsPath, s.disaggregatedPrefillHandler(APITypeChatCompletions))
+	mux.HandleFunc("POST "+ResponsesPath, s.disaggregatedPrefillHandler(APITypeResponses))
 
 	s.decoderProxy = s.createDecoderProxyHandler(s.config.DecoderURL, s.config.InsecureSkipVerifyForDecoder)
 
@@ -336,22 +423,7 @@ func (s *Server) createProxyHandler(
 	}
 
 	newProxy := httputil.NewSingleHostReverseProxy(u)
-	if u.Scheme == schemeHTTPS {
-		newProxy.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: insecureSkipVerify,
-				MinVersion:         tls.VersionTLS12,
-				CipherSuites: []uint16{
-					tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-					tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-					tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-					tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-					tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-					tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-				},
-			},
-		}
-	}
+	newProxy.Transport = s.newProxyTransport(u.Scheme, insecureSkipVerify)
 	cache.Add(hostPort, newProxy)
 
 	return newProxy, nil

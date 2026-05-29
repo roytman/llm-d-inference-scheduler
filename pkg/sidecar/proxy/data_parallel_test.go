@@ -11,9 +11,9 @@ import (
 	. "github.com/onsi/gomega"    // nolint:revive
 	"golang.org/x/sync/errgroup"
 
-	"github.com/llm-d/llm-d-inference-scheduler/pkg/common"
-	sidecarmock "github.com/llm-d/llm-d-inference-scheduler/test/sidecar/mock"
-	testutils "github.com/llm-d/llm-d-inference-scheduler/test/utils"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
+	sidecarmock "github.com/llm-d/llm-d-router/test/sidecar/mock"
+	testutils "github.com/llm-d/llm-d-router/test/utils"
 )
 
 const (
@@ -83,7 +83,7 @@ var _ = Describe("Data Parallel support", func() {
 			Expect(int(rank0Handler.RequestCount.Load())).To(Equal(1))
 			Expect(int(rank1Handler.RequestCount.Load())).To(Equal(0))
 
-			req.Header.Add(common.DataParallelEndpointHeader, "127.0.0.1:"+strconv.Itoa(fakeProxyPort+1))
+			req.Header.Add(routing.DataParallelEndpointHeader, "127.0.0.1:"+strconv.Itoa(fakeProxyPort+1))
 			resp = httptest.NewRecorder()
 			proxyHandler.ServeHTTP(resp, req)
 			Expect(int(rank0Handler.RequestCount.Load())).To(Equal(1))

@@ -4,15 +4,25 @@ on:
   push:
     branches:
       - main
+      - 'release-*'
   pull_request:
     branches:
       - main
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check-changes:
     runs-on: ubuntu-latest
     outputs:
       src: ${{ steps.filter.outputs.src }}
+      helm: ${{ steps.filter.outputs.helm }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v6
@@ -26,41 +36,77 @@ jobs:
               - Makefile*
               - go.mod
               - scripts/**
-  lint-and-test:
+              - .github/workflows/ci-pr-checks.yaml
+            helm:
+              - 'config/charts/**'
+              - 'hack/verify-helm.sh'
+  verify-helm-charts:
     needs: check-changes
-    if: ${{ needs.check-changes.outputs.src == 'true' }}
+    if: ${{ needs.check-changes.outputs.helm == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source
         uses: actions/checkout@v6
 
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run make verify-helm-charts
+        run: make verify-helm-charts
+
+  lint-and-test:
+    needs: check-changes
+    if: ${{ needs.check-changes.outputs.src == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GO_MOD_CACHE_VOL: /home/runner/.cache/llm-d-gomodcache
+      GO_BUILD_CACHE_VOL: /home/runner/.cache/llm-d-gobuildcache
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      # Custom profile with directory-only removals (run in parallel, no apt).
+      # The cleanup-profile: max is much more aggressive, it cleanups around 41GB,
+      # but runs 3.5 mins
+      - name: Free disk space
+        uses: justinthelaw/maximize-github-runner-space@v0.9.0
+        with:
+          cleanup-profile: custom
+          remove-android: 'true'
+          remove-dotnet: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-cached-tools: 'true'
+          remove-swift: 'true'
+          remove-julia: 'true'
+          remove-rust: 'true'
+          remove-miniconda: 'true'
+          swapfile-size: 0
+
       - name: Sanity check repo contents
         run: ls -la
 
-      - name: Create and resolve Go cache volumes
-        id: go-cache
-        run: |
-          docker volume create llm-d-gomodcache
-          docker volume create llm-d-gobuildcache
-          echo "mod=$(docker volume inspect llm-d-gomodcache -f '{{.Mountpoint}}')" >> $GITHUB_OUTPUT
-          echo "build=$(docker volume inspect llm-d-gobuildcache -f '{{.Mountpoint}}')" >> $GITHUB_OUTPUT
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false # only needed for `go list` in Makefile; module cache managed by the explicit cache step below
+
+      - name: Create Go cache dirs
+        run: mkdir -p "$GO_MOD_CACHE_VOL" "$GO_BUILD_CACHE_VOL"
 
       - name: Cache Go modules and build cache
         uses: actions/cache@v5
         with:
           path: |
-            ${{ steps.go-cache.outputs.mod }}
-            ${{ steps.go-cache.outputs.build }}
-          key: go-cache-${{ hashFiles('go.sum') }}
+            ${{ env.GO_MOD_CACHE_VOL }}
+            ${{ env.GO_BUILD_CACHE_VOL }}
+          key: go-cache-${{ runner.os }}-${{ hashFiles('go.sum') }}
           restore-keys: |
-            go-cache-
-
-      - name: Run make lint
-        run: make lint
-
-      - name: Run make build
-        shell: bash
-        run: make build
+            go-cache-${{ runner.os }}-
 
       # Restore the baseline saved from the last main push so the compare step
       # can diff against it. Missing cache (first PR ever) is not an error;
@@ -76,11 +122,68 @@ jobs:
         shell: bash
         run: make test-unit
 
+      - name: Run hermetic integration tests
+        shell: bash
+        run: make test-integration-hermetic
+
       - name: Compare coverage against main baseline
         if: github.event_name == 'pull_request'
         continue-on-error: true
         shell: bash
         run: make coverage-compare BASELINE_DIR=coverage/baseline
+
+      # Find the latest release-* branch (by SemVer) and download its coverage
+      # artifact so the PR can compare against the most recent release.
+      - name: Find latest release branch
+        if: github.event_name == 'pull_request'
+        id: find-releases
+        shell: bash
+        run: |
+          gh api "repos/${{ github.repository }}/branches" \
+            --paginate \
+            --jq '[.[] | select(.name | startswith("release-")) | .name][]' \
+            | sort -V | tail -1 > /tmp/release_branches.txt
+          echo "Release branches found:"
+          cat /tmp/release_branches.txt
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Download and compare release coverage baselines
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          if [[ ! -s /tmp/release_branches.txt ]]; then
+            echo "No release branches found, skipping."
+            exit 0
+          fi
+          while IFS= read -r branch; do
+            [[ -z "$branch" ]] && continue
+            echo "Looking up latest successful run for branch: $branch"
+            run_id=$(gh run list \
+              --repo "${{ github.repository }}" \
+              --branch "$branch" \
+              --workflow "CI - PR Checks" \
+              --status success \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // empty')
+            if [[ -z "$run_id" ]]; then
+              echo "No successful run found for $branch, skipping."
+              continue
+            fi
+            dest="coverage/release-baselines/$branch"
+            mkdir -p "$dest"
+            if gh run download "$run_id" \
+                --repo "${{ github.repository }}" \
+                --name "coverage-baseline-$branch" \
+                --dir "$dest"; then
+              make coverage-compare BASELINE_DIR="$dest" COVERAGE_LABEL="$branch"
+            else
+              echo "No coverage artifact for $branch in run $run_id, skipping."
+            fi
+          done < /tmp/release_branches.txt
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       # Copy the freshly generated profiles into coverage/baseline so that
       # the saved path matches the restored path on future PR runs.
@@ -97,6 +200,23 @@ jobs:
         with:
           path: coverage/baseline
           key: coverage-main
+
+      # Upload coverage profiles as a named artifact for release branches.
+      # Retrieved by PRs to compare against the most recent release.
+      - name: Upload coverage artifact (release branches)
+        if: >-
+          github.event_name == 'push' &&
+          startsWith(github.ref, 'refs/heads/release-')
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-baseline-${{ github.ref_name }}
+          path: coverage/*.out
+          retention-days: 400
+          overwrite: true
+
+      - name: Clean Docker system
+        shell: bash
+        run: docker system prune -af
 
       - name: Run make test-e2e
         shell: bash

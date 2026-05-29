@@ -1,10 +1,13 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -13,7 +16,8 @@ import (
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	"sigs.k8s.io/gateway-api-inference-extension/pkg/common"
+
+	"github.com/llm-d/llm-d-router/pkg/common"
 )
 
 // startHTTP starts the HTTP reverse proxy.
@@ -133,22 +137,7 @@ func (s *Server) startHTTP(ctx context.Context) error {
 // Passthrough decoder handler
 func (s *Server) createDecoderProxyHandler(decoderURL *url.URL, decoderInsecureSkipVerify bool) *httputil.ReverseProxy {
 	decoderProxy := httputil.NewSingleHostReverseProxy(decoderURL)
-	if decoderURL.Scheme == schemeHTTPS {
-		decoderProxy.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: decoderInsecureSkipVerify,
-				MinVersion:         tls.VersionTLS12,
-				CipherSuites: []uint16{
-					tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-					tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-					tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-					tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-					tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-					tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-				},
-			},
-		}
-	}
+	decoderProxy.Transport = s.newProxyTransport(decoderURL.Scheme, decoderInsecureSkipVerify)
 	decoderProxy.ErrorHandler = func(res http.ResponseWriter, _ *http.Request, err error) {
 
 		// Log errors from the decoder proxy
@@ -170,6 +159,50 @@ func (s *Server) createDecoderProxyHandler(decoderURL *url.URL, decoderInsecureS
 		}
 	}
 	return decoderProxy
+}
+
+func bodyAsJSON(r *http.Request) ([]byte, map[string]any, error) {
+	defer func() { _ = r.Body.Close() }()
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, nil, err
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, nil, fmt.Errorf("%w: %w", errInvalidJSON, err)
+	}
+	return raw, parsed, nil
+}
+
+func (s *Server) readJSONBody(r *http.Request, w http.ResponseWriter) ([]byte, map[string]any, bool) {
+	raw, parsed, err := bodyAsJSON(r)
+	if err != nil {
+		if !errors.Is(err, errInvalidJSON) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(err.Error()))
+		} else if writeErr := errorJSONInvalid(err, w); writeErr != nil {
+			s.logger.Error(writeErr, "failed to send error response to client")
+		}
+		return nil, nil, false
+	}
+	return raw, parsed, true
+}
+
+func cloneRequestWithBody(ctx context.Context, r *http.Request, body []byte) *http.Request {
+	cloned := r.Clone(ctx)
+	cloned.Body = io.NopCloser(bytes.NewReader(body))
+	cloned.ContentLength = int64(len(body))
+	return cloned
+}
+
+// extractHost returns the host part of a host:port string. If parsing
+// fails (e.g. no port), the input is returned as-is.
+func extractHost(hostWithPort string) string {
+	host, _, err := net.SplitHostPort(hostWithPort)
+	if err != nil {
+		return hostWithPort
+	}
+	return host
 }
 
 // isHTTPError returns true if the status code indicates an error (not in the 2xx range).

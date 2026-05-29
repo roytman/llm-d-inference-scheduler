@@ -17,34 +17,19 @@ limitations under the License.
 package proxy
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"net/http"
 	"strings"
 )
 
-func (s *Server) runSharedStorageProtocol(w http.ResponseWriter, r *http.Request, prefillPodHostPort string) {
+func (s *Server) handleSharedStorage(w http.ResponseWriter, r *http.Request, prefillPodHostPort string) {
 	s.logger.V(4).Info("running Shared Storage protocol", "url", prefillPodHostPort)
 
-	// Read and parse request body
-	defer r.Body.Close() //nolint:all
-	original, err := io.ReadAll(r.Body)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest) // TODO: check FastAPI error code when failing to read body
-		w.Write([]byte(err.Error()))         //nolint:all
-		return
-	}
-
-	// Parse completion request
-	var completionRequest map[string]any
-	if err := json.Unmarshal(original, &completionRequest); err != nil {
-		if err := errorJSONInvalid(err, w); err != nil {
-			s.logger.Error(err, "failed to send Invalid JSON error response to client")
-		}
+	original, completionRequest, ok := s.readJSONBody(r, w)
+	if !ok {
 		return
 	}
 
@@ -54,7 +39,7 @@ func (s *Server) runSharedStorageProtocol(w http.ResponseWriter, r *http.Request
 	// For more information refer to the RFC https://github.com/vllm-project/vllm/issues/24256
 	if cacheHitThreshold, hasCacheHitThreshold := completionRequest[requestFieldCacheHitThreshold]; hasCacheHitThreshold {
 		s.logger.V(4).Info("cache_hit_threshold field found in the request, trying to decode first", requestFieldCacheHitThreshold, cacheHitThreshold)
-		decodeReq := cloneRequestWithBody(r, original)
+		decodeReq := cloneRequestWithBody(r.Context(), r, original)
 		needsPrefill, err := s.tryDecode(w, decodeReq, completionRequest)
 		if err != nil {
 			return
@@ -83,7 +68,7 @@ func (s *Server) runSharedStorageProtocol(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	decodeReq := cloneRequestWithBody(r, decodeRequestBody)
+	decodeReq := cloneRequestWithBody(r.Context(), r, decodeRequestBody)
 	s.decoderProxy.ServeHTTP(w, decodeReq)
 }
 
@@ -108,7 +93,7 @@ func (s *Server) tryDecodeBuffered(w http.ResponseWriter, r *http.Request) (bool
 
 		w.WriteHeader(dw.statusCode)
 		if dw.buffer.Len() > 0 {
-			w.Write([]byte(dw.buffer.String())) //nolint:all
+			w.Write(dw.buffer.Bytes()) //nolint:errcheck
 		}
 
 		err := errors.New("decode request failed")
@@ -119,7 +104,7 @@ func (s *Server) tryDecodeBuffered(w http.ResponseWriter, r *http.Request) (bool
 
 	// Parse response to check finish_reason
 	var response map[string]any
-	if err := json.Unmarshal([]byte(dw.buffer.String()), &response); err != nil {
+	if err := json.Unmarshal(dw.buffer.Bytes(), &response); err != nil {
 		s.logger.Error(err, "failed to unmarshal decode response", "response", dw.buffer.String())
 
 		if err := errorInternalServerError(err, w); err != nil {
@@ -135,7 +120,7 @@ func (s *Server) tryDecodeBuffered(w http.ResponseWriter, r *http.Request) (bool
 
 	// Decode succeeded, write response to client
 	maps.Copy(w.Header(), dw.headers)
-	w.Write([]byte(dw.buffer.String())) //nolint:all
+	w.Write(dw.buffer.Bytes()) //nolint:errcheck
 
 	return false, nil
 }
@@ -240,7 +225,7 @@ func (s *Server) prefill(w http.ResponseWriter, r *http.Request, prefillPodHostP
 		}
 		return err
 	}
-	preq := cloneRequestWithBody(r, pbody)
+	preq := cloneRequestWithBody(r.Context(), r, pbody)
 
 	prefillHandler, err := s.prefillerProxyHandler(prefillPodHostPort)
 	if err != nil {
@@ -259,18 +244,11 @@ func (s *Server) prefill(w http.ResponseWriter, r *http.Request, prefillPodHostP
 		s.logger.Error(nil, "prefill request failed", "code", pw.statusCode)
 		w.WriteHeader(pw.statusCode)
 		if pw.buffer.Len() > 0 {
-			w.Write([]byte(pw.buffer.String())) //nolint:all
+			w.Write(pw.buffer.Bytes()) //nolint:errcheck
 		}
 		return fmt.Errorf("prefill request failed with status code: %d", pw.statusCode)
 	}
 
 	s.logger.V(4).Info("prefill completed successfully")
 	return nil
-}
-
-func cloneRequestWithBody(r *http.Request, body []byte) *http.Request {
-	cloned := r.Clone(r.Context())
-	cloned.Body = io.NopCloser(bytes.NewReader(body))
-	cloned.ContentLength = int64(len(body))
-	return cloned
 }

@@ -24,7 +24,6 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/llm-d/llm-d-inference-scheduler/pkg/common"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
@@ -33,18 +32,20 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
 	"go.opentelemetry.io/otel/trace"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 )
 
 const (
-	defaultServiceName = "llm-d-inference-scheduler"
+	defaultServiceName = "llm-d-router"
 
 	// instrumentationName identifies this instrumentation library in traces.
-	instrumentationName = "llm-d-inference-scheduler"
+	instrumentationName = "llm-d-router"
 )
 
 // InitTracing initializes OpenTelemetry tracing with OTLP exporter.
 // Configuration is done via environment variables:
-// - OTEL_SERVICE_NAME: Service name for tracing (default: llm-d-inference-scheduler)
+// - OTEL_SERVICE_NAME: Service name for tracing (default: llm-d-router)
 // - OTEL_EXPORTER_OTLP_ENDPOINT: OTLP collector endpoint (default: http://localhost:4317)
 // - OTEL_TRACES_SAMPLER: Sampling strategy (default: parentbased_traceidratio)
 // - OTEL_TRACES_SAMPLER_ARG: Sampling ratio (default: 0.1 for 10%)
@@ -65,7 +66,7 @@ func InitTracing(ctx context.Context) (func(context.Context) error, error) {
 
 	// Strip http:// or https:// prefix if present
 	// otlptracegrpc.WithEndpoint() expects host:port only
-	endpoint = common.StripScheme(endpoint)
+	endpoint = routing.StripScheme(endpoint)
 
 	logger.Info("Initializing OpenTelemetry tracing", "endpoint", endpoint, "service", serviceName)
 
@@ -122,7 +123,7 @@ func InitTracing(ctx context.Context) (func(context.Context) error, error) {
 	return tp.Shutdown, nil
 }
 
-// Tracer returns a tracer for the inference scheduler.
+// Tracer returns a tracer for the llm-d router.
 // The tracer is identified by the instrumentation library name, which is
 // distinct from the service name set during InitTracing().
 func Tracer() trace.Tracer {

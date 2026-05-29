@@ -17,17 +17,18 @@ limitations under the License.
 package proxy
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/llm-d/llm-d-inference-scheduler/pkg/common"
 	. "github.com/onsi/ginkgo/v2" // nolint:revive
 	. "github.com/onsi/gomega"    // nolint:revive
+
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 )
 
 var _ = Describe("SGLang Connector", func() {
@@ -63,40 +64,41 @@ var _ = Describe("SGLang Connector", func() {
 				"max_tokens": 50
 			}`
 
-		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, strings.NewReader(body))
+		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, bytes.NewReader([]byte(body)))
 		Expect(err).ToNot(HaveOccurred())
 
 		prefillHostPort := testInfo.prefillBackend.URL[len("http://"):]
-		req.Header.Add(common.PrefillEndpointHeader, prefillHostPort)
+		req.Header.Add(routing.PrefillEndpointHeader, prefillHostPort)
 
 		rp, err := http.DefaultClient.Do(req)
 		Expect(err).ToNot(HaveOccurred())
 
 		if rp.StatusCode != 200 {
-			bp, _ := io.ReadAll(rp.Body) //nolint:all
+			bp, _ := io.ReadAll(rp.Body) //nolint:errcheck
 			Fail(string(bp))
 		}
 
 		// Because SGLang connector sends requests concurrently (prefill in goroutine),
-		// we sleep a tiny bit to ensure the prefill handler has time to finish processing.
-		time.Sleep(100 * time.Millisecond)
+		// wait until the prefill handler has finished processing before reading its state.
+		Eventually(testInfo.prefillHandler.RequestCount.Load).Should(Equal(int32(1)))
 
 		// Validate prefill request
-		Expect(testInfo.prefillHandler.RequestCount.Load()).To(BeNumerically("==", 1))
-		Expect(testInfo.prefillHandler.CompletionRequests).To(HaveLen(1))
-		prq1 := testInfo.prefillHandler.CompletionRequests[0]
+		prefillReqs := testInfo.prefillHandler.GetCompletionRequests()
+		Expect(prefillReqs).To(HaveLen(1))
+		prq1 := prefillReqs[0]
 
 		// Validate decode request
 		Expect(testInfo.decodeHandler.RequestCount.Load()).To(BeNumerically("==", 1))
-		Expect(testInfo.decodeHandler.CompletionRequests).To(HaveLen(1))
-		drq1 := testInfo.decodeHandler.CompletionRequests[0]
+		decodeReqs := testInfo.decodeHandler.GetCompletionRequests()
+		Expect(decodeReqs).To(HaveLen(1))
+		drq1 := decodeReqs[0]
 
 		// Bootstrap validations for prefill
 		Expect(prq1).To(HaveKey(requestFieldBootstrapHost))
 		Expect(prq1).To(HaveKey(requestFieldBootstrapPort))
 		Expect(prq1).To(HaveKey(requestFieldBootstrapRoom))
 
-		expectedHost := strings.Split(prefillHostPort, ":")[0]
+		expectedHost := extractHost(prefillHostPort)
 		Expect(prq1[requestFieldBootstrapHost]).To(Equal(expectedHost))
 		Expect(prq1[requestFieldBootstrapPort]).To(Equal(float64(sglangBootstrapPort)))
 		Expect(prq1[requestFieldBootstrapRoom]).ToNot(BeNil())
@@ -154,11 +156,11 @@ var _ = Describe("SGLang Connector", func() {
 		proxyBaseAddr := "http://" + testInfo.proxy.addr.String()
 
 		body := `{"model": "Qwen", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 50}`
-		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, strings.NewReader(body))
+		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, bytes.NewReader([]byte(body)))
 		Expect(err).ToNot(HaveOccurred())
 
 		prefillHostPort := testInfo.prefillBackend.URL[len("http://"):]
-		req.Header.Add(common.PrefillEndpointHeader, prefillHostPort)
+		req.Header.Add(routing.PrefillEndpointHeader, prefillHostPort)
 
 		// Submit request. This will complete as soon as fastDecode completes.
 		rp, err := http.DefaultClient.Do(req)

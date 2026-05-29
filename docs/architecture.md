@@ -744,7 +744,7 @@ Several things should be noted:
 
 ### Speculative Indexing
 
-Speculative indexing closes the blind spot between a routing decision and KV event arrival by immediately writing a predicted cache entry to the prefix-cache index. This lets the next request with the same prefix hit the cache without waiting for engine confirmation. See [#538](https://github.com/llm-d/llm-d-inference-scheduler/issues/538) for background.
+Speculative indexing closes the blind spot between a routing decision and KV event arrival by immediately writing a predicted cache entry to the prefix-cache index. This lets the next request with the same prefix hit the cache without waiting for engine confirmation. See [#538](https://github.com/llm-d/llm-d-router/issues/538) for background.
 
 Enable via `precise-prefix-cache-scorer` parameters:
 

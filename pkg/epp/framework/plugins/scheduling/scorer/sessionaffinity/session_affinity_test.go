@@ -79,7 +79,7 @@ func TestSessionAffinityScoreWithSessionID(t *testing.T) {
 			request := &scheduling.InferenceRequest{}
 			if tt.sessionID != "" {
 				// Simulate session-id-producer having set the session ID
-				request.PutAttribute("SessionIDDataKey:test-producer", attrsession.SessionID(tt.sessionID))
+				request.PutAttribute(attrsession.SessionIDDataKey.WithNonEmptyProducerName("test-producer").String(), attrsession.SessionID(tt.sessionID))
 			}
 
 			scores := s.Score(ctx, request, endpoints)

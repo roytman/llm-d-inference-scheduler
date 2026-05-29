@@ -1,7 +1,6 @@
-package scorer
+package sessionaffinity
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -10,11 +9,13 @@ import (
 	"strings"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	logutil "sigs.k8s.io/gateway-api-inference-extension/pkg/common/observability/logging"
-	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/datalayer"
-	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/plugin"
-	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/requestcontrol"
-	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/scheduling"
+
+	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	attrsession "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/session"
 )
 
 const (
@@ -35,22 +36,21 @@ const (
 
 // compile-time type assertion
 var _ scheduling.Scorer = &SessionAffinity{}
-var _ requestcontrol.ResponseReceived = &SessionAffinity{}
+var _ requestcontrol.ResponseHeaderProcessor = &SessionAffinity{}
 
 type sessionAffinityConfig struct {
-	MaxAge int `json:"maxAge"` // Cookie Max-Age in seconds (0 = session cookie)
+	MaxAge                int    `json:"maxAge"`                // Cookie Max-Age in seconds (0 = session cookie)
+	SessionIDProducerName string `json:"sessionIDProducerName"` // Name of the session-id-producer to consume from
 }
 
 // SessionAffinityFactory defines the factory function for SessionAffinity scorer.
-func SessionAffinityFactory(name string, rawConfig json.RawMessage, _ plugin.Handle) (plugin.Plugin, error) {
+func SessionAffinityFactory(name string, parameters *json.Decoder, _ plugin.Handle) (plugin.Plugin, error) {
 	config := sessionAffinityConfig{
 		MaxAge: defaultMaxAge, // Set default
 	}
 
-	if len(rawConfig) > 0 {
-		decoder := json.NewDecoder(bytes.NewReader(rawConfig))
-		decoder.DisallowUnknownFields() // Reject unknown fields
-		if err := decoder.Decode(&config); err != nil {
+	if parameters != nil {
+		if err := parameters.Decode(&config); err != nil {
 			return nil, fmt.Errorf("invalid session affinity config: %w", err)
 		}
 	}
@@ -58,16 +58,18 @@ func SessionAffinityFactory(name string, rawConfig json.RawMessage, _ plugin.Han
 	if config.MaxAge < 0 {
 		return nil, fmt.Errorf("invalid session affinity config: maxAge must be >= 0, got %d", config.MaxAge)
 	}
-	return NewSessionAffinity(config.MaxAge).WithName(name), nil
+	return NewSessionAffinity(config.MaxAge, config.SessionIDProducerName).WithName(name), nil
 }
 
 // NewSessionAffinity returns a scorer with the given maxAge configuration.
 // maxAge specifies the cookie's Max-Age attribute in seconds.
 // If 0 (default), the cookie is a session cookie (expires when browser closes).
-func NewSessionAffinity(maxAge int) *SessionAffinity {
+// sessionIDProducerName is the name of the session-id-producer to read session data from.
+func NewSessionAffinity(maxAge int, sessionIDProducerName string) *SessionAffinity {
 	return &SessionAffinity{
-		typedName: plugin.TypedName{Type: SessionAffinityType},
-		maxAge:    maxAge,
+		typedName:      plugin.TypedName{Type: SessionAffinityType},
+		maxAge:         maxAge,
+		sessionDataKey: attrsession.SessionIDDataKey.WithNonEmptyProducerName(sessionIDProducerName),
 	}
 }
 
@@ -76,8 +78,9 @@ func NewSessionAffinity(maxAge int) *SessionAffinity {
 // session was sent to, by giving that pod the specified weight and assigning
 // zero score to the rest of the targets
 type SessionAffinity struct {
-	typedName plugin.TypedName
-	maxAge    int
+	typedName      plugin.TypedName
+	maxAge         int
+	sessionDataKey plugin.DataKey
 }
 
 // TypedName returns the typed name of the plugin.
@@ -97,22 +100,20 @@ func (s *SessionAffinity) Category() scheduling.ScorerCategory {
 }
 
 // Score assign a high score to the pod used in previous requests and zero to others
-func (s *SessionAffinity) Score(ctx context.Context, _ *scheduling.CycleState, request *scheduling.LLMRequest, endpoints []scheduling.Endpoint) map[scheduling.Endpoint]float64 {
+func (s *SessionAffinity) Score(ctx context.Context, request *scheduling.InferenceRequest, endpoints []scheduling.Endpoint) map[scheduling.Endpoint]float64 {
 	scoredEndpoints := make(map[scheduling.Endpoint]float64)
 	target := ""
 
-	// Extract session cookie from Cookie header, if request and headers are available.
-	if request != nil && request.Headers != nil {
-		cookieHeader := request.Headers[CookieHeaderName]
-		if cookieHeader != "" {
-			sessionToken := extractCookieValue(cookieHeader, SessionCookieName)
-			if sessionToken != "" {
-				decodedBytes, err := base64.StdEncoding.DecodeString(sessionToken)
-				if err != nil {
-					log.FromContext(ctx).Error(err, "Error decoding session cookie")
-				} else {
-					target = string(decodedBytes)
-				}
+	// Read session ID from the session-id-producer data
+	if request != nil {
+		sessionID, ok := s.readSessionID(request)
+		if ok && sessionID != "" {
+			// Decode the session ID to get the target endpoint name
+			decodedBytes, err := base64.StdEncoding.DecodeString(sessionID)
+			if err != nil {
+				log.FromContext(ctx).V(logutil.DEBUG).Info("Error decoding session ID", "error", err)
+			} else {
+				target = string(decodedBytes)
 			}
 		}
 	}
@@ -127,15 +128,32 @@ func (s *SessionAffinity) Score(ctx context.Context, _ *scheduling.CycleState, r
 	return scoredEndpoints
 }
 
-// ResponseReceived sets the session cookie on the response sent to the client
+// Consumes declares the SessionID attribute key read by this scorer.
+func (s *SessionAffinity) Consumes() map[plugin.DataKey]any {
+	return map[plugin.DataKey]any{
+		s.sessionDataKey: attrsession.SessionID(""),
+	}
+}
+
+// readSessionID reads the session ID from the request attributes.
+func (s *SessionAffinity) readSessionID(request *scheduling.InferenceRequest) (string, bool) {
+	if request == nil {
+		return "", false
+	}
+	key := s.sessionDataKey.String()
+	sessionID, ok := scheduling.ReadRequestAttribute[attrsession.SessionID](request, key)
+	return string(sessionID), ok
+}
+
+// ResponseHeader sets the session cookie on the response sent to the client
 // only if the cookie doesn't exist or its value is different
-func (s *SessionAffinity) ResponseReceived(ctx context.Context, request *scheduling.LLMRequest, response *requestcontrol.Response, targetEndpoint *datalayer.EndpointMetadata) {
+func (s *SessionAffinity) ResponseHeader(ctx context.Context, request *scheduling.InferenceRequest, response *requestcontrol.Response, targetEndpoint *datalayer.EndpointMetadata) {
 	logger := log.FromContext(ctx)
 
 	if response == nil || targetEndpoint == nil {
 		reqID := "undefined"
 		if response != nil {
-			reqID = response.RequestId
+			reqID = response.RequestID
 		}
 		logger.V(logutil.DEBUG).Info("Session affinity scorer - skip post response because one of response, targetEndpoint is nil", "req id", reqID)
 		return

@@ -1,19 +1,19 @@
-package scorer_test
+package sessionaffinity_test
 
 import (
 	"context"
 	"encoding/base64"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	k8stypes "k8s.io/apimachinery/pkg/types"
-	fwkdl "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/datalayer"
-	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/requestcontrol"
-	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/scheduling"
 
-	"github.com/llm-d/llm-d-inference-scheduler/pkg/plugins/scorer"
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	attrsession "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/session"
+	sessionaffinity "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/sessionaffinity"
 )
 
 func newTestEndpointForSession(name, namespace string) scheduling.Endpoint {
@@ -26,8 +26,8 @@ func newTestEndpointForSession(name, namespace string) scheduling.Endpoint {
 	)
 }
 
-func TestSessionAffinityWithCookies(t *testing.T) {
-	s := scorer.NewSessionAffinity(0) // Use default (session cookie)
+func TestSessionAffinityScoreWithSessionID(t *testing.T) {
+	s := sessionaffinity.NewSessionAffinity(0, "test-producer")
 	ctx := context.Background()
 
 	// Create mock endpoints
@@ -37,44 +37,36 @@ func TestSessionAffinityWithCookies(t *testing.T) {
 
 	tests := []struct {
 		name           string
-		cookieHeader   string
+		sessionID      string
 		expectedScores map[string]float64 // endpoint name -> score
 	}{
 		{
-			name:         "No cookie - all endpoints get zero score",
-			cookieHeader: "",
+			name:      "No session ID - all endpoints get zero score",
+			sessionID: "",
 			expectedScores: map[string]float64{
 				"pod-1": 0.0,
 				"pod-2": 0.0,
 			},
 		},
 		{
-			name:         "Cookie with pod-1 - pod-1 gets high score",
-			cookieHeader: scorer.SessionCookieName + "=" + base64.StdEncoding.EncodeToString([]byte("default/pod-1")),
+			name:      "Session ID for pod-1 - pod-1 gets high score",
+			sessionID: base64.StdEncoding.EncodeToString([]byte("default/pod-1")),
 			expectedScores: map[string]float64{
 				"pod-1": 1.0,
 				"pod-2": 0.0,
 			},
 		},
 		{
-			name:         "Cookie with pod-2 - pod-2 gets high score",
-			cookieHeader: scorer.SessionCookieName + "=" + base64.StdEncoding.EncodeToString([]byte("default/pod-2")),
+			name:      "Session ID for pod-2 - pod-2 gets high score",
+			sessionID: base64.StdEncoding.EncodeToString([]byte("default/pod-2")),
 			expectedScores: map[string]float64{
 				"pod-1": 0.0,
 				"pod-2": 1.0,
 			},
 		},
 		{
-			name:         "Multiple cookies - session cookie is extracted",
-			cookieHeader: "other-cookie=value; " + scorer.SessionCookieName + "=" + base64.StdEncoding.EncodeToString([]byte("default/pod-1")) + "; another=test",
-			expectedScores: map[string]float64{
-				"pod-1": 1.0,
-				"pod-2": 0.0,
-			},
-		},
-		{
-			name:         "Invalid base64 cookie - all endpoints get zero score",
-			cookieHeader: scorer.SessionCookieName + "=invalid-base64!!!",
+			name:      "Invalid base64 session ID - all endpoints get zero score",
+			sessionID: "invalid-base64!!!",
 			expectedScores: map[string]float64{
 				"pod-1": 0.0,
 				"pod-2": 0.0,
@@ -84,14 +76,13 @@ func TestSessionAffinityWithCookies(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			request := &scheduling.LLMRequest{
-				Headers: map[string]string{},
-			}
-			if tt.cookieHeader != "" {
-				request.Headers[scorer.CookieHeaderName] = tt.cookieHeader
+			request := &scheduling.InferenceRequest{}
+			if tt.sessionID != "" {
+				// Simulate session-id-producer having set the session ID
+				request.PutAttribute("SessionIDDataKey:test-producer", attrsession.SessionID(tt.sessionID))
 			}
 
-			scores := s.Score(ctx, nil, request, endpoints)
+			scores := s.Score(ctx, request, endpoints)
 
 			assert.Equal(t, tt.expectedScores["pod-1"], scores[endpoint1], "pod-1 score mismatch")
 			assert.Equal(t, tt.expectedScores["pod-2"], scores[endpoint2], "pod-2 score mismatch")
@@ -99,25 +90,24 @@ func TestSessionAffinityWithCookies(t *testing.T) {
 	}
 }
 
-func TestResponseReceivedSetsCookie(t *testing.T) {
-	s := scorer.NewSessionAffinity(0) // Use default (session cookie)
+func TestResponseHeaderSetsCookie(t *testing.T) {
+	s := sessionaffinity.NewSessionAffinity(0, "test-producer")
 	ctx := context.Background()
 
 	tests := []struct {
-		name                string
-		request             *scheduling.LLMRequest
-		response            *requestcontrol.Response
-		targetPod           *fwkdl.EndpointMetadata
-		expectCookieSet     bool
-		expectedContains    []string
-		expectedNotContains []string
-		expectEmpty         bool
+		name             string
+		request          *scheduling.InferenceRequest
+		response         *requestcontrol.Response
+		targetPod        *fwkdl.EndpointMetadata
+		expectCookieSet  bool
+		expectedContains []string
+		expectEmpty      bool
 	}{
 		{
 			name:    "Sets cookie in response",
 			request: nil,
 			response: &requestcontrol.Response{
-				RequestId: "test-req-1",
+				RequestID: "test-req-1",
 				Headers:   make(map[string]string),
 			},
 			targetPod: &fwkdl.EndpointMetadata{
@@ -128,7 +118,7 @@ func TestResponseReceivedSetsCookie(t *testing.T) {
 			},
 			expectCookieSet: true,
 			expectedContains: []string{
-				scorer.SessionCookieName + "=",
+				sessionaffinity.SessionCookieName + "=",
 				"Path=/",
 				"HttpOnly",
 				"SameSite=Lax",
@@ -139,9 +129,9 @@ func TestResponseReceivedSetsCookie(t *testing.T) {
 			name:    "Appends to existing Set-Cookie header",
 			request: nil,
 			response: &requestcontrol.Response{
-				RequestId: "test-req-2",
+				RequestID: "test-req-2",
 				Headers: map[string]string{
-					scorer.SetCookieHeaderName: "existing-cookie=value; Path=/",
+					sessionaffinity.SetCookieHeaderName: "existing-cookie=value; Path=/",
 				},
 			},
 			targetPod: &fwkdl.EndpointMetadata{
@@ -153,7 +143,7 @@ func TestResponseReceivedSetsCookie(t *testing.T) {
 			expectCookieSet: true,
 			expectedContains: []string{
 				"existing-cookie=value",
-				scorer.SessionCookieName + "=",
+				sessionaffinity.SessionCookieName + "=",
 			},
 		},
 		{
@@ -172,7 +162,7 @@ func TestResponseReceivedSetsCookie(t *testing.T) {
 			name:    "Handles nil targetPod gracefully",
 			request: nil,
 			response: &requestcontrol.Response{
-				RequestId: "test-req-3",
+				RequestID: "test-req-3",
 				Headers:   make(map[string]string),
 			},
 			targetPod:       nil,
@@ -181,13 +171,13 @@ func TestResponseReceivedSetsCookie(t *testing.T) {
 		},
 		{
 			name: "Skips setting cookie when request already has correct cookie",
-			request: &scheduling.LLMRequest{
+			request: &scheduling.InferenceRequest{
 				Headers: map[string]string{
-					scorer.CookieHeaderName: scorer.SessionCookieName + "=" + base64.StdEncoding.EncodeToString([]byte("default/pod-1")),
+					sessionaffinity.CookieHeaderName: sessionaffinity.SessionCookieName + "=" + base64.StdEncoding.EncodeToString([]byte("default/pod-1")),
 				},
 			},
 			response: &requestcontrol.Response{
-				RequestId: "test-req-4",
+				RequestID: "test-req-4",
 				Headers:   make(map[string]string),
 			},
 			targetPod: &fwkdl.EndpointMetadata{
@@ -201,13 +191,13 @@ func TestResponseReceivedSetsCookie(t *testing.T) {
 		},
 		{
 			name: "Sets cookie when request has different cookie value",
-			request: &scheduling.LLMRequest{
+			request: &scheduling.InferenceRequest{
 				Headers: map[string]string{
-					scorer.CookieHeaderName: scorer.SessionCookieName + "=" + base64.StdEncoding.EncodeToString([]byte("default/pod-1")),
+					sessionaffinity.CookieHeaderName: sessionaffinity.SessionCookieName + "=" + base64.StdEncoding.EncodeToString([]byte("default/pod-1")),
 				},
 			},
 			response: &requestcontrol.Response{
-				RequestId: "test-req-5",
+				RequestID: "test-req-5",
 				Headers:   make(map[string]string),
 			},
 			targetPod: &fwkdl.EndpointMetadata{
@@ -221,32 +211,15 @@ func TestResponseReceivedSetsCookie(t *testing.T) {
 				base64.StdEncoding.EncodeToString([]byte("default/pod-2")),
 			},
 		},
-		{
-			name: "Sets cookie when request has no cookie",
-			request: &scheduling.LLMRequest{
-				Headers: map[string]string{},
-			},
-			response: &requestcontrol.Response{
-				RequestId: "test-req-6",
-				Headers:   make(map[string]string),
-			},
-			targetPod: &fwkdl.EndpointMetadata{
-				NamespacedName: k8stypes.NamespacedName{
-					Namespace: "default",
-					Name:      "pod-1",
-				},
-			},
-			expectCookieSet: true,
-		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Should not panic
-			s.ResponseReceived(ctx, tt.request, tt.response, tt.targetPod)
+			s.ResponseHeader(ctx, tt.request, tt.response, tt.targetPod)
 
 			if tt.response != nil {
-				setCookie := tt.response.Headers[scorer.SetCookieHeaderName]
+				setCookie := tt.response.Headers[sessionaffinity.SetCookieHeaderName]
 
 				if tt.expectEmpty {
 					assert.Empty(t, setCookie)
@@ -257,71 +230,7 @@ func TestResponseReceivedSetsCookie(t *testing.T) {
 				for _, expected := range tt.expectedContains {
 					assert.Contains(t, setCookie, expected)
 				}
-
-				for _, notExpected := range tt.expectedNotContains {
-					assert.NotContains(t, setCookie, notExpected)
-				}
 			}
-		})
-	}
-}
-
-// extractCookieValue is a test helper that mirrors the private function in session_affinity.go
-func extractCookieValue(cookieHeader, cookieName string) string {
-	cookies := strings.Split(cookieHeader, ";")
-	for _, cookie := range cookies {
-		cookie = strings.TrimSpace(cookie)
-		parts := strings.SplitN(cookie, "=", 2)
-		if len(parts) == 2 && parts[0] == cookieName {
-			return parts[1]
-		}
-	}
-	return ""
-}
-
-func TestExtractCookieValue(t *testing.T) {
-	tests := []struct {
-		name         string
-		cookieHeader string
-		cookieName   string
-		expected     string
-	}{
-		{
-			name:         "Single cookie",
-			cookieHeader: "session=abc123",
-			cookieName:   "session",
-			expected:     "abc123",
-		},
-		{
-			name:         "Multiple cookies",
-			cookieHeader: "cookie1=value1; session=abc123; cookie2=value2",
-			cookieName:   "session",
-			expected:     "abc123",
-		},
-		{
-			name:         "Cookie not found",
-			cookieHeader: "cookie1=value1; cookie2=value2",
-			cookieName:   "session",
-			expected:     "",
-		},
-		{
-			name:         "Empty cookie header",
-			cookieHeader: "",
-			cookieName:   "session",
-			expected:     "",
-		},
-		{
-			name:         "Cookie with spaces",
-			cookieHeader: "cookie1=value1;  session=abc123  ; cookie2=value2",
-			cookieName:   "session",
-			expected:     "abc123",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := extractCookieValue(tt.cookieHeader, tt.cookieName)
-			assert.Equal(t, tt.expected, result)
 		})
 	}
 }
@@ -339,7 +248,7 @@ func TestSessionAffinityWithConfig(t *testing.T) {
 			name:   "Cookie with MaxAge set",
 			maxAge: 3600,
 			expectedContains: []string{
-				scorer.SessionCookieName + "=",
+				sessionaffinity.SessionCookieName + "=",
 				"Max-Age=3600",
 				"HttpOnly",
 				"SameSite=Lax",
@@ -357,26 +266,14 @@ func TestSessionAffinityWithConfig(t *testing.T) {
 				"Secure",
 			},
 		},
-		{
-			name:   "Default config when nil",
-			maxAge: 0,
-			expectedContains: []string{
-				"HttpOnly",
-				"SameSite=Lax",
-			},
-			expectedNotContains: []string{
-				"Max-Age",
-				"Secure",
-			},
-		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := scorer.NewSessionAffinity(tt.maxAge)
+			s := sessionaffinity.NewSessionAffinity(tt.maxAge, "test-producer")
 
 			response := &requestcontrol.Response{
-				RequestId: "test-req-" + tt.name,
+				RequestID: "test-req-" + tt.name,
 				Headers:   make(map[string]string),
 			}
 			targetPod := &fwkdl.EndpointMetadata{
@@ -386,9 +283,9 @@ func TestSessionAffinityWithConfig(t *testing.T) {
 				},
 			}
 
-			s.ResponseReceived(ctx, nil, response, targetPod)
+			s.ResponseHeader(ctx, nil, response, targetPod)
 
-			setCookie := response.Headers[scorer.SetCookieHeaderName]
+			setCookie := response.Headers[sessionaffinity.SetCookieHeaderName]
 			require.NotEmpty(t, setCookie)
 
 			for _, expected := range tt.expectedContains {

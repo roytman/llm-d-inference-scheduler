@@ -99,6 +99,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/vllmhttp"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/prefixcacheaffinity"
+	sessionaffinityfilter "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/sessionaffinity"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/sloheadroomtier"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/picker/maxscore"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/picker/random"
@@ -510,7 +511,7 @@ func (r *Runner) registerInTreePlugins() {
 
 	// extra scheduling scorers
 	fwkplugin.Register(loadaware.LoadAwareType, loadaware.Factory)
-	fwkplugin.Register(sessionaffinity.SessionAffinityType, sessionaffinity.Factory)
+	fwkplugin.Register(sessionaffinity.SessionAffinityType, sessionaffinity.SessionAffinityFactory)
 	fwkplugin.Register(contextlengthaware.ContextLengthAwareType, contextlengthaware.Factory)
 
 	// data layer models source/extractor
@@ -563,6 +564,7 @@ func (r *Runner) registerInTreePlugins() {
 
 	// Latency scoring and filtering plugins
 	fwkplugin.Register(prefixcacheaffinity.PluginType, prefixcacheaffinity.Factory)
+	fwkplugin.Register(sessionaffinityfilter.PluginType, sessionaffinityfilter.Factory)
 	fwkplugin.Register(sloheadroomtier.PluginType, sloheadroomtier.Factory)
 	fwkplugin.Register(latencyscorer.LatencyScorerType, latencyscorer.Factory)
 	fwkplugin.Register(bylabel.PrefillRoleType, bylabel.PrefillRoleFactory)

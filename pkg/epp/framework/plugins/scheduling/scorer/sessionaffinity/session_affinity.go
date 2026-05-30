@@ -43,8 +43,8 @@ type sessionAffinityConfig struct {
 	SessionIDProducerName string `json:"sessionIDProducerName"` // Name of the session-id-producer to consume from
 }
 
-// SessionAffinityFactory defines the factory function for SessionAffinity scorer.
-func SessionAffinityFactory(name string, parameters *json.Decoder, _ plugin.Handle) (plugin.Plugin, error) {
+// Factory defines the factory function for SessionAffinity scorer.
+func Factory(name string, parameters *json.Decoder, _ plugin.Handle) (plugin.Plugin, error) {
 	config := sessionAffinityConfig{
 		MaxAge: defaultMaxAge, // Set default
 	}

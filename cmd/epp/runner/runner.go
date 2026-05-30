@@ -511,7 +511,7 @@ func (r *Runner) registerInTreePlugins() {
 
 	// extra scheduling scorers
 	fwkplugin.Register(loadaware.LoadAwareType, loadaware.Factory)
-	fwkplugin.Register(sessionaffinity.SessionAffinityType, sessionaffinity.SessionAffinityFactory)
+	fwkplugin.Register(sessionaffinity.SessionAffinityType, sessionaffinity.Factory)
 	fwkplugin.Register(contextlengthaware.ContextLengthAwareType, contextlengthaware.Factory)
 
 	// data layer models source/extractor

@@ -28,7 +28,7 @@ llm-d Router. Go service that routes inference requests to model-serving pods vi
 - Minimalism: smallest correct change inside the smallest scope.
 - Non-trivial work must be tracked in an issue. If there isn't one, ask the user to file or link it.
 - The PR addresses that issue and nothing else: no renames, reformatting, refactors, new abstractions, or pattern changes beyond what the issue requires.
-- Unrelated improvements belong in their own issue, not folded into this PR. If you spot dead code or unrelated bugs in passing, mention them; don't fix them.
+- Unrelated improvements belong in their own issue and PR, not folded into this PR. If you spot dead code or unrelated bugs in passing, mention them; don't fix them.
 - Self-check on the way out: if the change grew larger than expected or the fix feels hacky, rewrite the clean version before opening the PR.
 
 ## Reviewing pull requests

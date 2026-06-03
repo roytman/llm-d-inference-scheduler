@@ -21,7 +21,7 @@ llm-d Router. Go service that routes inference requests to model-serving pods vi
 - Tests in the same package describe the contract. Read them before changing behavior.
 - Verify behavior against the code, not from filenames or familiarity. Run the build or read the test when uncertain.
 - Do not claim work is complete without running `make presubmit` (or the targeted test) and confirming the relevant output. "Tests pass" is a claim, not a fact, until the command output exists.
-- If execution goes sideways (unexpected state, cascading failures, a fix that breaks adjacent code), stop and re-plan. Restate what you know, identify where the plan broke, propose a revised path before continuing.
+- If execution goes sideways (unexpected state, cascading failures, a fix that breaks adjacent code), stop and replan. Restate what you know, identify where the plan broke, propose a revised path before continuing.
 
 ## Pull requests
 

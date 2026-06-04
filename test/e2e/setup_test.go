@@ -156,6 +156,8 @@ func createEndPointPicker(eppConfig string) []string {
 		})
 	if !usesTokenProducer(eppConfig) {
 		eppYamls = removeRenderSidecar(eppYamls)
+	} else {
+		eppYamls = rewriteModelCacheToHostPath(eppYamls, hfCacheHostPath)
 	}
 
 	objects = append(objects, testutils.CreateObjsFromYaml(testConfig, eppYamls)...)

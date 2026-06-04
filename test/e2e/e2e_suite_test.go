@@ -76,6 +76,10 @@ var (
 	sideCarImage     = env.GetEnvString("SIDECAR_IMAGE", "ghcr.io/llm-d/llm-d-router-disagg-sidecar:dev", ginkgo.GinkgoLogr)
 	vllmRenderImage  = env.GetEnvString("VLLM_RENDER_IMAGE", "vllm/vllm-openai-cpu:v0.21.0", ginkgo.GinkgoLogr)
 	loadRenderImage  = env.GetEnvBool("LOAD_VLLM_RENDER_IMAGE", true, ginkgo.GinkgoLogr)
+	// hfCacheHostPath, when non-empty, is bind-mounted into the kind node at
+	// /opt/hf-cache and used as a hostPath for the render sidecar's
+	// /root/.cache/huggingface, so weights survive across CI runs.
+	hfCacheHostPath = env.GetEnvString("HF_CACHE_HOST_PATH", "", ginkgo.GinkgoLogr)
 	// nsName is the namespace in which the K8S objects will be created
 	nsName = env.GetEnvString("NAMESPACE", "default", ginkgo.GinkgoLogr)
 
@@ -197,6 +201,7 @@ func setupK8sCluster() {
 		}()
 		clusterConfig := strings.ReplaceAll(kindClusterConfig, "${PORT}", port)
 		clusterConfig = strings.ReplaceAll(clusterConfig, "${METRICS_PORT}", metricsPort)
+		clusterConfig = strings.ReplaceAll(clusterConfig, "${EXTRA_MOUNTS}", extraMountsBlock(hfCacheHostPath))
 		_, err := io.WriteString(stdin, clusterConfig)
 		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
 	}()
@@ -370,5 +375,20 @@ nodes:
     protocol: TCP
   - containerPort: 32090
     hostPort: ${METRICS_PORT}
-    protocol: TCP
+    protocol: TCP${EXTRA_MOUNTS}
 `
+
+// extraMountsBlock returns a YAML fragment to splice under the kind node when a
+// HuggingFace weights cache is provided. The host path is bind-mounted into the
+// kind node at hfCacheNodePath; setup_test.go points the render sidecar's
+// model-cache volume at the same node path.
+func extraMountsBlock(hostPath string) string {
+	if hostPath == "" {
+		return ""
+	}
+	return fmt.Sprintf("\n  extraMounts:\n  - hostPath: %s\n    containerPath: %s", hostPath, hfCacheNodePath)
+}
+
+// hfCacheNodePath is the path inside the kind node where the host HF cache is
+// mounted; the render sidecar pod hostPath references this.
+const hfCacheNodePath = "/opt/hf-cache"

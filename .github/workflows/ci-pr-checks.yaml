@@ -450,4 +450,5 @@ jobs:
           E2E_LABEL_FILTER: ${{ matrix.suite.label-filter }}
           LOAD_VLLM_RENDER_IMAGE: ${{ matrix.suite.needs-renderer }}
           PULL_VLLM_RENDER_IMAGE: "false"
+          HF_CACHE_HOST_PATH: ${{ matrix.suite.needs-renderer == 'true' && steps.e2e-setup.outputs.hf-cache-host-path || '' }}
         run: make test-e2e-scheduler-run

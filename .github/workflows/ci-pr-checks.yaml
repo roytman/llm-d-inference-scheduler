@@ -442,6 +442,28 @@ jobs:
             docker load --input "$image"
           done
 
+      # HuggingFace weights cache. Only the renderer-using suite touches the
+      # cache key, so parallel matrix entries cannot race to save an empty
+      # directory under the same key. Bump the trailing -vN when kvModelName
+      # in test/e2e/e2e_suite_test.go changes; otherwise stale weights are
+      # served.
+      - name: Create HF cache dir
+        if: ${{ matrix.suite.needs-renderer == 'true' }}
+        id: hf-cache
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/hf-cache"
+          echo "path=${RUNNER_TEMP}/hf-cache" >> "$GITHUB_OUTPUT"
+
+      - name: Cache HuggingFace weights
+        if: ${{ matrix.suite.needs-renderer == 'true' }}
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.hf-cache.outputs.path }}
+          key: hf-cache-${{ runner.os }}-Qwen2.5-1.5B-Instruct-v2
+          restore-keys: |
+            hf-cache-${{ runner.os }}-Qwen2.5-1.5B-Instruct-
+
       - name: Run e2e-router (${{ matrix.suite.name }})
         shell: bash
         env:
@@ -450,5 +472,5 @@ jobs:
           E2E_LABEL_FILTER: ${{ matrix.suite.label-filter }}
           LOAD_VLLM_RENDER_IMAGE: ${{ matrix.suite.needs-renderer }}
           PULL_VLLM_RENDER_IMAGE: "false"
-          HF_CACHE_HOST_PATH: ${{ matrix.suite.needs-renderer == 'true' && steps.e2e-setup.outputs.hf-cache-host-path || '' }}
+          HF_CACHE_HOST_PATH: ${{ steps.hf-cache.outputs.path }}
         run: make test-e2e-scheduler-run

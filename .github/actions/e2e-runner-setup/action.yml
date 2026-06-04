@@ -7,9 +7,6 @@ outputs:
   go-build-cache:
     description: Absolute path to the Go build cache directory
     value: ${{ steps.go-cache.outputs.build }}
-  hf-cache-host-path:
-    description: Host path of the HuggingFace weights cache (for kind extraMounts)
-    value: ${{ steps.hf-cache.outputs.path }}
 runs:
   using: "composite"
   steps:
@@ -48,21 +45,3 @@ runs:
         key: go-cache-${{ runner.os }}-${{ hashFiles('go.sum') }}
         restore-keys: |
           go-cache-${{ runner.os }}-
-
-    # HuggingFace weights cache for the vllm-render sidecar. Bump the trailing
-    # -vN when kvModelName in test/e2e/e2e_suite_test.go changes, otherwise the
-    # cache will serve stale weights.
-    - name: Create HF cache dir
-      id: hf-cache
-      shell: bash
-      run: |
-        mkdir -p "${RUNNER_TEMP}/hf-cache"
-        echo "path=${RUNNER_TEMP}/hf-cache" >> "$GITHUB_OUTPUT"
-
-    - name: Cache HuggingFace weights
-      uses: actions/cache@v5
-      with:
-        path: ${{ steps.hf-cache.outputs.path }}
-        key: hf-cache-${{ runner.os }}-Qwen2.5-1.5B-Instruct-v1
-        restore-keys: |
-          hf-cache-${{ runner.os }}-Qwen2.5-1.5B-Instruct-

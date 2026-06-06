@@ -15,10 +15,13 @@ limitations under the License.
 */
 
 // Package sessionid provides a DataProducer that extracts a session
-// identifier from a configured request header or named cookie and publishes
-// it as a SessionID attribute on the InferenceRequest attribute store, so
-// that affinity-aware scorers and filters can read it without knowing how
-// the session was carried on the wire.
+// identifier from a configured request header or named cookie and tracks
+// which endpoint each active session was last routed to. The producer
+// publishes two attributes on the InferenceRequest attribute store:
+// SessionID (always, when an identifier is present) and BoundEndpoint (when
+// the session has been pinned to an endpoint by a previous request). The
+// post-schedule PreRequest hook records the chosen endpoint so the next
+// request in the same session can be steered back to it.
 package sessionid
 
 import (
@@ -26,7 +29,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2/expirable"
+	k8stypes "k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -41,26 +50,47 @@ const SessionIDProducerType = sessionidconstants.SessionIDProducerType
 // Headers in InferenceRequest are normalized to lowercase.
 const cookieHeader = "cookie"
 
+const (
+	// defaultLRUSize bounds the number of concurrent session bindings tracked.
+	defaultLRUSize = 1024
+
+	// defaultTTL is how long an idle binding survives before eviction.
+	defaultTTL = 30 * time.Minute
+)
+
 // Parameters configures the session-id producer.
 //
-// Exactly one of HeaderName or CookieName must be set:
+// Source selection (exactly one required):
 //   - HeaderName: read the value of the named request header verbatim.
 //   - CookieName: parse the standard "cookie" request header and read the
 //     value of the named cookie.
+//
+// Binding store (optional, applies to the BoundEndpoint attribute):
+//   - LRUSize: maximum number of sessions retained, default 1024.
+//   - TTL: idle lifetime of a binding as a Go duration ("30m", "1h"),
+//     default "30m". Must be > 0 when set.
 type Parameters struct {
-	HeaderName string `json:"headerName"`
-	CookieName string `json:"cookieName"`
+	HeaderName string `json:"headerName,omitempty"`
+	CookieName string `json:"cookieName,omitempty"`
+	LRUSize    int    `json:"lruSize,omitempty"`
+	TTL        string `json:"ttl,omitempty"`
 }
 
-var _ requestcontrol.DataProducer = &Producer{}
+var (
+	_ requestcontrol.DataProducer = &Producer{}
+	_ requestcontrol.PreRequest   = &Producer{}
+)
 
-// Producer extracts a session identifier from each incoming request and
-// publishes it as an endpoint attribute.
+// Producer extracts a session identifier from each incoming request,
+// publishes it as a SessionID attribute, and looks up / records the
+// endpoint that the session is bound to.
 type Producer struct {
 	typedName  fwkplugin.TypedName
-	dk         fwkplugin.DataKey
+	sessionDK  fwkplugin.DataKey
+	bindingDK  fwkplugin.DataKey
 	headerName string
 	cookieName string
+	bindings   *lru.LRU[attrsession.SessionID, k8stypes.NamespacedName]
 }
 
 // Factory builds a Producer from raw plugin parameters.
@@ -82,11 +112,33 @@ func Factory(name string, rawParameters *json.Decoder, _ fwkplugin.Handle) (fwkp
 		return nil, fmt.Errorf("'%s' requires exactly one of headerName or cookieName to be set, not both", SessionIDProducerType)
 	}
 
+	size := defaultLRUSize
+	if params.LRUSize != 0 {
+		if params.LRUSize < 0 {
+			return nil, fmt.Errorf("'%s': lruSize must be > 0, got %d", SessionIDProducerType, params.LRUSize)
+		}
+		size = params.LRUSize
+	}
+
+	ttl := defaultTTL
+	if params.TTL != "" {
+		parsed, err := time.ParseDuration(params.TTL)
+		if err != nil {
+			return nil, fmt.Errorf("'%s': invalid ttl %q: %w", SessionIDProducerType, params.TTL, err)
+		}
+		if parsed <= 0 {
+			return nil, fmt.Errorf("'%s': ttl must be > 0, got %s", SessionIDProducerType, parsed)
+		}
+		ttl = parsed
+	}
+
 	return &Producer{
 		typedName:  fwkplugin.TypedName{Type: SessionIDProducerType, Name: name},
-		dk:         attrsession.SessionIDDataKey.WithNonEmptyProducerName(name),
+		sessionDK:  attrsession.SessionIDDataKey.WithNonEmptyProducerName(name),
+		bindingDK:  attrsession.BoundEndpointDataKey.WithNonEmptyProducerName(name),
 		headerName: header,
 		cookieName: cookie,
+		bindings:   lru.NewLRU[attrsession.SessionID, k8stypes.NamespacedName](size, nil, ttl),
 	}, nil
 }
 
@@ -95,15 +147,19 @@ func (p *Producer) TypedName() fwkplugin.TypedName {
 	return p.typedName
 }
 
-// Produces declares the SessionID attribute key written by this producer.
+// Produces declares the SessionID and BoundEndpoint attribute keys this
+// producer may write.
 func (p *Producer) Produces() map[fwkplugin.DataKey]any {
-	return map[fwkplugin.DataKey]any{p.dk: attrsession.SessionID("")}
+	return map[fwkplugin.DataKey]any{
+		p.sessionDK: attrsession.SessionID(""),
+		p.bindingDK: attrsession.BoundEndpoint{},
+	}
 }
 
-// Produce extracts the session identifier from the request and writes it to
-// the request's attribute store. When no identifier can be found the
-// producer is a no-op; consumers must handle absence as "no session
-// preference".
+// Produce extracts the session identifier from the request, publishes it as
+// the SessionID attribute, and, if the session is currently bound to an
+// endpoint, also publishes BoundEndpoint. Absence of either is a no-op:
+// consumers must treat missing attributes as "no preference".
 func (p *Producer) Produce(_ context.Context, request *fwksched.InferenceRequest, _ []fwksched.Endpoint) error {
 	if request == nil {
 		return nil
@@ -112,8 +168,34 @@ func (p *Producer) Produce(_ context.Context, request *fwksched.InferenceRequest
 	if id == "" {
 		return nil
 	}
-	request.PutAttribute(p.dk.String(), attrsession.SessionID(id))
+	sessionID := attrsession.SessionID(id)
+	request.PutAttribute(p.sessionDK.String(), sessionID)
+	if bound, ok := p.bindings.Get(sessionID); ok {
+		request.PutAttribute(p.bindingDK.String(), attrsession.BoundEndpoint(bound))
+	}
 	return nil
+}
+
+// PreRequest records the endpoint chosen by the scheduler for this session,
+// refreshing the entry's TTL on each call. Requests without a session, or
+// without a primary-profile target, are ignored.
+func (p *Producer) PreRequest(ctx context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult) {
+	logger := log.FromContext(ctx).V(logutil.DEBUG)
+
+	if request == nil || schedulingResult == nil {
+		return
+	}
+	id := p.extract(request)
+	if id == "" {
+		return
+	}
+	target, ok := primaryTarget(schedulingResult)
+	if !ok {
+		logger.Info("session-id-producer: no primary target endpoint to bind", "sessionID", id)
+		return
+	}
+	p.bindings.Add(attrsession.SessionID(id), target)
+	logger.Info("session-id-producer: bound session", "sessionID", id, "endpoint", target)
 }
 
 func (p *Producer) extract(request *fwksched.InferenceRequest) string {
@@ -145,4 +227,21 @@ func cookieValue(header, name string) string {
 		}
 	}
 	return ""
+}
+
+// primaryTarget returns the namespaced name of the first endpoint chosen by
+// the primary profile, if any.
+func primaryTarget(result *fwksched.SchedulingResult) (k8stypes.NamespacedName, bool) {
+	if result == nil {
+		return k8stypes.NamespacedName{}, false
+	}
+	profile, ok := result.ProfileResults[result.PrimaryProfileName]
+	if !ok || profile == nil || len(profile.TargetEndpoints) == 0 {
+		return k8stypes.NamespacedName{}, false
+	}
+	endpoint := profile.TargetEndpoints[0]
+	if endpoint == nil {
+		return k8stypes.NamespacedName{}, false
+	}
+	return endpoint.GetMetadata().NamespacedName, true
 }

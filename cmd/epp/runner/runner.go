@@ -517,6 +517,8 @@ func (r *Runner) registerInTreePlugins() {
 	fwkplugin.Register(tokenizer.PluginType, tokenizer.PluginFactory)
 	fwkplugin.Register(tokenizer.LegacyPluginType, tokenizer.LegacyPluginFactory) //nolint:staticcheck // intentional: keep backward compatibility
 	fwkplugin.RegisterAsDefaultProducer(sessionid.SessionIDProducerType, sessionid.Factory, attrsession.SessionIDDataKey)
+	// The session-id-producer also publishes BoundEndpoint, so register it as the default for that key too.
+	fwkplugin.RegisterAsDefaultProducer(sessionid.SessionIDProducerType, sessionid.Factory, attrsession.BoundEndpointDataKey)
 
 	// Latency predictor plugins
 	fwkplugin.Register(latencyslo.LatencyAdmissionPluginType, latencyslo.LatencyAdmissionFactory)

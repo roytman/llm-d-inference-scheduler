@@ -14,17 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package sessionaffinity provides a filter that enforces hard session affinity.
-// When a session identifier is present, only the endpoint running that session
-// is kept. When no session exists, all endpoints pass through for scoring.
+// Package sessionaffinity provides a filter that enforces hard session
+// affinity. When the request's session is bound to a candidate endpoint, only
+// that endpoint is kept; otherwise all candidates pass through unchanged.
 package sessionaffinity
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
@@ -33,21 +33,26 @@ import (
 	attrsession "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/session"
 )
 
-const (
-	PluginType = "session-affinity-filter"
-)
+// PluginType is the registered type of the session-affinity filter.
+const PluginType = "session-affinity-filter"
 
 var _ fwksched.Filter = &Plugin{}
 
+// Config holds the filter's configurable parameters.
 type Config struct {
+	// SessionIDProducerName names the session-id-producer instance whose
+	// BoundEndpoint attribute this filter consumes. Empty selects the default
+	// producer.
 	SessionIDProducerName string `json:"sessionIDProducerName,omitempty"`
 }
 
+// Plugin is the session-affinity filter.
 type Plugin struct {
-	typedName      fwkplugin.TypedName
-	sessionDataKey fwkplugin.DataKey
+	typedName fwkplugin.TypedName
+	bindingDK fwkplugin.DataKey
 }
 
+// Factory builds a Plugin from raw plugin parameters.
 func Factory(name string, rawParameters *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
 	config := Config{}
 	if rawParameters != nil {
@@ -57,76 +62,57 @@ func Factory(name string, rawParameters *json.Decoder, _ fwkplugin.Handle) (fwkp
 	}
 
 	return &Plugin{
-		typedName:      fwkplugin.TypedName{Type: PluginType, Name: name},
-		sessionDataKey: attrsession.SessionIDDataKey.WithNonEmptyProducerName(config.SessionIDProducerName),
+		typedName: fwkplugin.TypedName{Type: PluginType, Name: name},
+		bindingDK: attrsession.BoundEndpointDataKey.WithNonEmptyProducerName(config.SessionIDProducerName),
 	}, nil
 }
 
+// TypedName returns the typed name of the plugin.
 func (p *Plugin) TypedName() fwkplugin.TypedName {
 	return p.typedName
 }
 
-// Filter enforces hard session affinity. If a session ID is present and matches
-// an endpoint, only that endpoint is returned. Otherwise, all endpoints pass through.
+// Filter narrows the candidate set to the session's bound endpoint when one
+// is published and present. When the binding is absent or its endpoint is no
+// longer in the candidate list, all candidates pass through unchanged so
+// other plugins can pick a replacement.
 func (p *Plugin) Filter(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) []fwksched.Endpoint {
-	logger := log.FromContext(ctx)
+	logger := log.FromContext(ctx).V(logutil.DEBUG)
 
 	if len(endpoints) <= 1 {
 		return endpoints
 	}
 
-	// Read session ID from request attributes (populated by session-id-producer)
-	sessionID, ok := p.readSessionID(request)
-	if !ok || sessionID == "" {
-		logger.V(logutil.DEBUG).Info("SessionAffinityFilter: no session ID, keeping all endpoints",
-			"total", len(endpoints))
+	bound, ok := p.readBinding(request)
+	if !ok {
+		logger.Info("session-affinity-filter: no binding, keeping all endpoints", "total", len(endpoints))
 		return endpoints
 	}
 
-	// Decode the session ID to get the target endpoint name
-	targetEndpoint := p.decodeSessionID(sessionID)
-	if targetEndpoint == "" {
-		logger.V(logutil.DEBUG).Info("SessionAffinityFilter: invalid session ID, keeping all endpoints",
-			"sessionID", sessionID, "total", len(endpoints))
-		return endpoints
-	}
-
-	// Find the endpoint matching the session
+	target := k8stypes.NamespacedName(bound)
 	for _, ep := range endpoints {
-		if ep.GetMetadata().NamespacedName.String() == targetEndpoint {
-			logger.V(logutil.DEBUG).Info("SessionAffinityFilter: session match found, returning single endpoint",
-				"sessionID", sessionID, "targetEndpoint", targetEndpoint)
+		if ep.GetMetadata().NamespacedName == target {
+			logger.Info("session-affinity-filter: binding matches a candidate, returning single endpoint",
+				"endpoint", target)
 			return []fwksched.Endpoint{ep}
 		}
 	}
 
-	// Session endpoint not in candidate list, keep all for scoring
-	logger.V(logutil.DEBUG).Info("SessionAffinityFilter: session endpoint not found in candidates, keeping all",
-		"sessionID", sessionID, "targetEndpoint", targetEndpoint, "total", len(endpoints))
+	logger.Info("session-affinity-filter: bound endpoint not in candidates, keeping all",
+		"endpoint", target, "total", len(endpoints))
 	return endpoints
 }
 
+// Consumes declares the BoundEndpoint attribute key read by this filter.
 func (p *Plugin) Consumes() map[fwkplugin.DataKey]any {
 	return map[fwkplugin.DataKey]any{
-		p.sessionDataKey: attrsession.SessionID(""),
+		p.bindingDK: attrsession.BoundEndpoint{},
 	}
 }
 
-func (p *Plugin) readSessionID(request *fwksched.InferenceRequest) (string, bool) {
+func (p *Plugin) readBinding(request *fwksched.InferenceRequest) (attrsession.BoundEndpoint, bool) {
 	if request == nil {
-		return "", false
+		return attrsession.BoundEndpoint{}, false
 	}
-	key := p.sessionDataKey.String()
-	sessionID, ok := fwksched.ReadRequestAttribute[attrsession.SessionID](request, key)
-	return string(sessionID), ok
-}
-
-// decodeSessionID decodes a base64-encoded session ID to get the endpoint name.
-// Returns empty string if decoding fails.
-func (p *Plugin) decodeSessionID(sessionID string) string {
-	decodedBytes, err := base64.StdEncoding.DecodeString(sessionID)
-	if err != nil {
-		return ""
-	}
-	return string(decodedBytes)
+	return fwksched.ReadRequestAttribute[attrsession.BoundEndpoint](request, p.bindingDK.String())
 }

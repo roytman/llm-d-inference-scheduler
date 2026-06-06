@@ -20,10 +20,13 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrsession "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/session"
@@ -53,9 +56,14 @@ func TestFactory_Validation(t *testing.T) {
 		{name: "header only", params: json.RawMessage(`{"headerName":"x-session-id"}`)},
 		{name: "cookie only", params: json.RawMessage(`{"cookieName":"llm-d-session"}`)},
 		{name: "header normalized", params: json.RawMessage(`{"headerName":" X-Session-ID "}`)},
+		{name: "with binding tuning", params: json.RawMessage(`{"headerName":"x","lruSize":10,"ttl":"5m"}`)},
 		{name: "empty object", params: json.RawMessage(`{}`), wantErr: true, errSubstr: validationErr},
 		{name: "both set", params: json.RawMessage(`{"headerName":"x","cookieName":"y"}`), wantErr: true, errSubstr: validationErr},
 		{name: "empty strings", params: json.RawMessage(`{"headerName":"","cookieName":""}`), wantErr: true, errSubstr: validationErr},
+		{name: "negative lru size", params: json.RawMessage(`{"headerName":"x","lruSize":-1}`), wantErr: true, errSubstr: "lruSize"},
+		{name: "zero ttl", params: json.RawMessage(`{"headerName":"x","ttl":"0s"}`), wantErr: true, errSubstr: "ttl"},
+		{name: "negative ttl", params: json.RawMessage(`{"headerName":"x","ttl":"-1m"}`), wantErr: true, errSubstr: "ttl"},
+		{name: "unparseable ttl", params: json.RawMessage(`{"headerName":"x","ttl":"not-a-duration"}`), wantErr: true, errSubstr: "invalid ttl"},
 		{name: "invalid json", params: json.RawMessage(`not-json`), wantErr: true, errSubstr: "failed to parse"},
 		{name: "unknown field", params: json.RawMessage(`{"headerName":"x","other":"y"}`), wantErr: true, errSubstr: "failed to parse"},
 		{name: "nil raw message", params: nil, wantErr: true, errSubstr: validationErr},
@@ -216,7 +224,140 @@ func TestProduces_DeclaresKey(t *testing.T) {
 
 	producer := mustFactory(t, `{"headerName":"x"}`)
 	produces := producer.Produces()
-	expectedKey := attrsession.SessionIDDataKey.WithNonEmptyProducerName("session-id-producer")
-	_, ok := produces[expectedKey]
-	assert.True(t, ok, "Produces() must declare %v", expectedKey)
+	for _, key := range []fwkplugin.DataKey{
+		attrsession.SessionIDDataKey.WithNonEmptyProducerName("session-id-producer"),
+		attrsession.BoundEndpointDataKey.WithNonEmptyProducerName("session-id-producer"),
+	} {
+		_, ok := produces[key]
+		assert.True(t, ok, "Produces() must declare %v", key)
+	}
+}
+
+// requestWithSession is a small helper for binding tests; the producer reads
+// session IDs from request headers and never panics on a nil Headers map.
+func requestWithSession(id string) *fwksched.InferenceRequest {
+	return &fwksched.InferenceRequest{Headers: map[string]string{"x-session-id": id}}
+}
+
+func endpointFor(name string) fwksched.Endpoint {
+	return fwksched.NewEndpoint(
+		&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Namespace: "default", Name: name}},
+		&fwkdl.Metrics{},
+		nil,
+	)
+}
+
+func schedulingResultFor(profile string, endpoint fwksched.Endpoint) *fwksched.SchedulingResult {
+	return &fwksched.SchedulingResult{
+		PrimaryProfileName: profile,
+		ProfileResults: map[string]*fwksched.ProfileRunResult{
+			profile: {TargetEndpoints: []fwksched.Endpoint{endpoint}},
+		},
+	}
+}
+
+func TestPreRequestThenProducePublishesBinding(t *testing.T) {
+	t.Parallel()
+
+	producer := mustFactory(t, `{"headerName":"x-session-id"}`)
+	bindReq := requestWithSession("session-A")
+	producer.PreRequest(context.Background(), bindReq, schedulingResultFor("default", endpointFor("pod-1")))
+
+	lookup := requestWithSession("session-A")
+	require.NoError(t, producer.Produce(context.Background(), lookup, nil))
+
+	got, ok := fwksched.ReadRequestAttribute[attrsession.BoundEndpoint](
+		lookup,
+		attrsession.BoundEndpointDataKey.WithNonEmptyProducerName("session-id-producer").String(),
+	)
+	require.True(t, ok)
+	assert.Equal(t, attrsession.BoundEndpoint{Namespace: "default", Name: "pod-1"}, got)
+}
+
+func TestPreRequestIgnoresMissingSession(t *testing.T) {
+	t.Parallel()
+
+	producer := mustFactory(t, `{"headerName":"x-session-id"}`)
+	producer.PreRequest(
+		context.Background(),
+		&fwksched.InferenceRequest{}, // no session header
+		schedulingResultFor("default", endpointFor("pod-1")),
+	)
+
+	// A subsequent Produce on a different session must not see the (non-existent) binding.
+	lookup := requestWithSession("session-A")
+	require.NoError(t, producer.Produce(context.Background(), lookup, nil))
+	_, ok := fwksched.ReadRequestAttribute[attrsession.BoundEndpoint](
+		lookup,
+		attrsession.BoundEndpointDataKey.WithNonEmptyProducerName("session-id-producer").String(),
+	)
+	assert.False(t, ok)
+}
+
+func TestPreRequestIgnoresEmptyResult(t *testing.T) {
+	t.Parallel()
+
+	producer := mustFactory(t, `{"headerName":"x-session-id"}`)
+	bindReq := requestWithSession("session-A")
+	producer.PreRequest(context.Background(), bindReq, &fwksched.SchedulingResult{
+		PrimaryProfileName: "default",
+		ProfileResults:     map[string]*fwksched.ProfileRunResult{},
+	})
+
+	lookup := requestWithSession("session-A")
+	require.NoError(t, producer.Produce(context.Background(), lookup, nil))
+	_, ok := fwksched.ReadRequestAttribute[attrsession.BoundEndpoint](
+		lookup,
+		attrsession.BoundEndpointDataKey.WithNonEmptyProducerName("session-id-producer").String(),
+	)
+	assert.False(t, ok)
+}
+
+func TestBindingExpiresAfterTTL(t *testing.T) {
+	t.Parallel()
+
+	producer := mustFactory(t, `{"headerName":"x-session-id","ttl":"50ms"}`)
+	bind := requestWithSession("session-A")
+	producer.PreRequest(context.Background(), bind, schedulingResultFor("default", endpointFor("pod-1")))
+
+	time.Sleep(120 * time.Millisecond)
+
+	lookup := requestWithSession("session-A")
+	require.NoError(t, producer.Produce(context.Background(), lookup, nil))
+	_, ok := fwksched.ReadRequestAttribute[attrsession.BoundEndpoint](
+		lookup,
+		attrsession.BoundEndpointDataKey.WithNonEmptyProducerName("session-id-producer").String(),
+	)
+	assert.False(t, ok, "binding should have expired")
+}
+
+func TestBindingsEvictedAtCapacity(t *testing.T) {
+	t.Parallel()
+
+	producer := mustFactory(t, `{"headerName":"x-session-id","lruSize":2}`)
+
+	bind := func(session, endpoint string) {
+		producer.PreRequest(
+			context.Background(),
+			requestWithSession(session),
+			schedulingResultFor("default", endpointFor(endpoint)),
+		)
+	}
+	bind("session-0", "pod-1")
+	bind("session-1", "pod-2")
+	bind("session-2", "pod-3") // evicts session-0
+
+	for i, session := range []string{"session-0", "session-1", "session-2"} {
+		lookup := requestWithSession(session)
+		require.NoError(t, producer.Produce(context.Background(), lookup, nil))
+		_, ok := fwksched.ReadRequestAttribute[attrsession.BoundEndpoint](
+			lookup,
+			attrsession.BoundEndpointDataKey.WithNonEmptyProducerName("session-id-producer").String(),
+		)
+		if i == 0 {
+			assert.False(t, ok, "expected %s to be evicted", session)
+		} else {
+			assert.True(t, ok, "expected %s to be present", session)
+		}
+	}
 }

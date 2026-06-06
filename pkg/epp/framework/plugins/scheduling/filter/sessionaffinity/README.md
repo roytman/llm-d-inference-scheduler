@@ -56,7 +56,7 @@ Both plugins consume the same `BoundEndpoint` attribute but differ in how strict
 | **Guarantee** | Hard, only the bound endpoint is returned when present | Soft, bound endpoint gets the highest score, others remain |
 | **On endpoint unavailability** | Falls back to the full candidate set | Other scorers determine the winner |
 
-Use the filter when strict stickiness is required for correctness. Use the scorer when a best-effort preference is sufficient, or pair them for hard pinning with score-based fallback when the binding is missing.
+Use the filter when strict stickiness is required for correctness. Use the scorer when a best-effort preference is sufficient and other scorers should still get a vote. Configuring both at once is redundant: the filter dominates the scorer in every case, so the extra scoring work changes no outcomes.
 
 ## Related Documentation
 

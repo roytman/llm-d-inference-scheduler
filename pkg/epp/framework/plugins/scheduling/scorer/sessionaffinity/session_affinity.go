@@ -14,9 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package sessionaffinity provides the soft session-affinity scorer. It reads
-// the BoundEndpoint attribute published by the session-binding-producer and
-// gives the bound endpoint a maximum score, leaving everything else at zero.
 package sessionaffinity
 
 import (
@@ -33,8 +30,10 @@ import (
 // SessionAffinityType is the type of the SessionAffinity scorer.
 const SessionAffinityType = "session-affinity-scorer"
 
-// compile-time type assertion
-var _ scheduling.Scorer = &SessionAffinity{}
+var (
+	_ scheduling.Scorer     = &SessionAffinity{}
+	_ plugin.ConsumerPlugin = &SessionAffinity{}
+)
 
 // Config holds the scorer's configurable parameters.
 type Config struct {
@@ -45,11 +44,16 @@ type Config struct {
 }
 
 // Factory builds a SessionAffinity scorer from raw plugin parameters.
-func Factory(name string, parameters *json.Decoder, _ plugin.Handle) (plugin.Plugin, error) {
+func Factory(name string, parameters *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
 	config := Config{}
 	if parameters != nil {
 		if err := parameters.Decode(&config); err != nil {
 			return nil, fmt.Errorf("invalid session affinity config: %w", err)
+		}
+	}
+	if handle != nil {
+		if err := attrsession.RegisterAffinityMetrics(handle.Metrics()); err != nil {
+			return nil, err
 		}
 	}
 	return NewSessionAffinity(config.SessionIDProducerName).WithName(name), nil
@@ -94,19 +98,29 @@ func (s *SessionAffinity) Score(_ context.Context, request *scheduling.Inference
 	scoredEndpoints := make(map[scheduling.Endpoint]float64, len(endpoints))
 	target, hasTarget := s.readBinding(request)
 
+	matched := false
 	for _, endpoint := range endpoints {
 		scoredEndpoints[endpoint] = 0.0
 		if hasTarget && endpointHostPort(endpoint) == string(target) {
 			scoredEndpoints[endpoint] = 1.0
+			matched = true
 		}
+	}
+	if hasTarget && !matched && len(endpoints) > 0 {
+		attrsession.RecordStaleBinding(s.typedName.Name, s.typedName.Type)
 	}
 	return scoredEndpoints
 }
 
 // Consumes declares the BoundEndpoint attribute key read by this scorer.
-func (s *SessionAffinity) Consumes() map[plugin.DataKey]any {
-	return map[plugin.DataKey]any{
-		s.bindingDK: attrsession.BoundEndpoint(""),
+// The key is Required: a soft scorer with no producer always returns zeros,
+// which is a silent misconfiguration; the framework fails fast at init
+// time so the operator notices.
+func (s *SessionAffinity) Consumes() plugin.DataDependencies {
+	return plugin.DataDependencies{
+		Required: map[plugin.DataKey]any{
+			s.bindingDK: attrsession.BoundEndpoint(""),
+		},
 	}
 }
 
@@ -122,10 +136,10 @@ func (s *SessionAffinity) readBinding(request *scheduling.InferenceRequest) (att
 }
 
 // endpointHostPort returns the canonical host:port form of an endpoint, or
-// the empty string when either coordinate is missing.
+// the empty string when metadata is missing or either coordinate is empty.
 func endpointHostPort(ep scheduling.Endpoint) string {
 	meta := ep.GetMetadata()
-	if meta.Address == "" || meta.Port == "" {
+	if meta == nil || meta.Address == "" || meta.Port == "" {
 		return ""
 	}
 	return net.JoinHostPort(meta.Address, meta.Port)

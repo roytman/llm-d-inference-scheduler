@@ -54,8 +54,15 @@ const (
 	// defaultLRUSize bounds the number of concurrent session bindings tracked.
 	defaultLRUSize = 1024
 
-	// defaultTTL is how long an idle binding survives before eviction.
+	// defaultTTL is how long a binding survives without activity before
+	// eviction. Both PreRequest writes and successful Produce reads refresh
+	// the entry, so an active session keeps its binding alive.
 	defaultTTL = 30 * time.Minute
+
+	// defaultAutoHeaderName is the source header used when the producer is
+	// auto-instantiated as the default for SessionIDDataKey or
+	// BoundEndpointDataKey, i.e. invoked without explicit parameters.
+	defaultAutoHeaderName = "x-session-id"
 )
 
 // Parameters configures the session-id producer.
@@ -93,13 +100,18 @@ type Producer struct {
 	bindings   *lru.LRU[attrsession.SessionID, attrsession.BoundEndpoint]
 }
 
-// Factory builds a Producer from raw plugin parameters.
+// Factory builds a Producer from raw plugin parameters. When rawParameters
+// is nil (auto-instantiation as the default producer for SessionIDDataKey or
+// BoundEndpointDataKey), HeaderName defaults to defaultAutoHeaderName so a
+// sensible producer comes up without explicit configuration.
 func Factory(name string, rawParameters *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
 	params := Parameters{}
 	if rawParameters != nil {
 		if err := rawParameters.Decode(&params); err != nil {
 			return nil, fmt.Errorf("failed to parse the parameters of the '%s' producer: %w", SessionIDProducerType, err)
 		}
+	} else {
+		params.HeaderName = defaultAutoHeaderName
 	}
 
 	header := strings.ToLower(strings.TrimSpace(params.HeaderName))
@@ -171,6 +183,9 @@ func (p *Producer) Produce(_ context.Context, request *fwksched.InferenceRequest
 	sessionID := attrsession.SessionID(id)
 	request.PutAttribute(p.sessionDK.String(), sessionID)
 	if bound, ok := p.bindings.Get(sessionID); ok {
+		// Re-Add to refresh the TTL: an active session that keeps reading
+		// its binding should not expire under a write-only refresh policy.
+		p.bindings.Add(sessionID, bound)
 		request.PutAttribute(p.bindingDK.String(), bound)
 	}
 	return nil
@@ -245,7 +260,7 @@ func primaryTarget(result *fwksched.SchedulingResult) (attrsession.BoundEndpoint
 		return "", false
 	}
 	meta := endpoint.GetMetadata()
-	if meta.Address == "" || meta.Port == "" {
+	if meta == nil || meta.Address == "" || meta.Port == "" {
 		return "", false
 	}
 	return attrsession.BoundEndpoint(net.JoinHostPort(meta.Address, meta.Port)), true

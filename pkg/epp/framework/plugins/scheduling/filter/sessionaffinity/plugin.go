@@ -36,7 +36,10 @@ import (
 // PluginType is the registered type of the session-affinity filter.
 const PluginType = "session-affinity-filter"
 
-var _ fwksched.Filter = &Plugin{}
+var (
+	_ fwksched.Filter          = &Plugin{}
+	_ fwkplugin.ConsumerPlugin = &Plugin{}
+)
 
 // Config holds the filter's configurable parameters.
 type Config struct {
@@ -53,11 +56,17 @@ type Plugin struct {
 }
 
 // Factory builds a Plugin from raw plugin parameters.
-func Factory(name string, rawParameters *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
 	config := Config{}
 	if rawParameters != nil {
 		if err := rawParameters.Decode(&config); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+		}
+	}
+
+	if handle != nil {
+		if err := attrsession.RegisterAffinityMetrics(handle.Metrics()); err != nil {
+			return nil, err
 		}
 	}
 
@@ -77,35 +86,44 @@ func (p *Plugin) TypedName() fwkplugin.TypedName {
 // longer in the candidate list, all candidates pass through unchanged so
 // other plugins can pick a replacement.
 func (p *Plugin) Filter(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) []fwksched.Endpoint {
-	logger := log.FromContext(ctx).V(logutil.DEBUG)
+	logger := log.FromContext(ctx)
+	debug := logger.V(logutil.DEBUG)
 
+	// With zero or one candidates the binding match cannot change the
+	// outcome (an empty set stays empty; a single candidate is also the
+	// fallback we would return on a miss), so skip the lookup entirely.
 	if len(endpoints) <= 1 {
 		return endpoints
 	}
 
 	bound, ok := p.readBinding(request)
 	if !ok {
-		logger.Info("session-affinity-filter: no binding, keeping all endpoints", "total", len(endpoints))
+		debug.Info("session-affinity-filter: no binding, keeping all endpoints", "total", len(endpoints))
 		return endpoints
 	}
 
 	for _, ep := range endpoints {
 		if endpointHostPort(ep) == string(bound) {
-			logger.Info("session-affinity-filter: binding matches a candidate, returning single endpoint",
+			debug.Info("session-affinity-filter: binding matches a candidate, returning single endpoint",
 				"endpoint", string(bound))
 			return []fwksched.Endpoint{ep}
 		}
 	}
 
+	attrsession.RecordStaleBinding(p.typedName.Name, p.typedName.Type)
 	logger.Info("session-affinity-filter: bound endpoint not in candidates, keeping all",
 		"endpoint", string(bound), "total", len(endpoints))
 	return endpoints
 }
 
 // Consumes declares the BoundEndpoint attribute key read by this filter.
-func (p *Plugin) Consumes() map[fwkplugin.DataKey]any {
-	return map[fwkplugin.DataKey]any{
-		p.bindingDK: attrsession.BoundEndpoint(""),
+// The key is Required: hard affinity has no useful behavior without a
+// producer, so the framework fails fast at init time when one is missing.
+func (p *Plugin) Consumes() fwkplugin.DataDependencies {
+	return fwkplugin.DataDependencies{
+		Required: map[fwkplugin.DataKey]any{
+			p.bindingDK: attrsession.BoundEndpoint(""),
+		},
 	}
 }
 
@@ -121,10 +139,10 @@ func (p *Plugin) readBinding(request *fwksched.InferenceRequest) (attrsession.Bo
 }
 
 // endpointHostPort returns the canonical host:port form of an endpoint, or
-// the empty string when either coordinate is missing.
+// the empty string when metadata is missing or either coordinate is empty.
 func endpointHostPort(ep fwksched.Endpoint) string {
 	meta := ep.GetMetadata()
-	if meta.Address == "" || meta.Port == "" {
+	if meta == nil || meta.Address == "" || meta.Port == "" {
 		return ""
 	}
 	return net.JoinHostPort(meta.Address, meta.Port)

@@ -67,8 +67,11 @@ func TestFactory_Validation(t *testing.T) {
 		{name: "unparsable ttl", params: json.RawMessage(`{"headerName":"x","ttl":"not-a-duration"}`), wantErr: true, errSubstr: "invalid ttl"},
 		{name: "invalid json", params: json.RawMessage(`not-json`), wantErr: true, errSubstr: "failed to parse"},
 		{name: "unknown field", params: json.RawMessage(`{"headerName":"x","other":"y"}`), wantErr: true, errSubstr: "failed to parse"},
-		{name: "nil raw message", params: nil, wantErr: true, errSubstr: validationErr},
-		{name: "zero-length raw message", params: json.RawMessage{}, wantErr: true, errSubstr: validationErr},
+		// Auto-instantiation as the default producer passes a nil decoder; the
+		// factory uses the default header in that case so a sensible producer
+		// comes up without a parameters block.
+		{name: "nil raw message uses default header", params: nil},
+		{name: "zero-length raw message uses default header", params: json.RawMessage{}},
 	}
 
 	for _, tc := range tests {
@@ -83,6 +86,25 @@ func TestFactory_Validation(t *testing.T) {
 			assert.NoError(t, err)
 		})
 	}
+}
+
+func TestFactory_AutoInstantiationUsesDefaultHeader(t *testing.T) {
+	t.Parallel()
+
+	plg, err := sessionid.Factory("session-id-producer", nil, nil)
+	require.NoError(t, err)
+	producer, ok := plg.(*sessionid.Producer)
+	require.True(t, ok)
+
+	request := &fwksched.InferenceRequest{Headers: map[string]string{"x-session-id": "session-A"}}
+	require.NoError(t, producer.Produce(context.Background(), request, nil))
+
+	id, ok := fwksched.ReadRequestAttribute[attrsession.SessionID](
+		request,
+		attrsession.SessionIDDataKey.WithNonEmptyProducerName("session-id-producer").String(),
+	)
+	require.True(t, ok)
+	assert.Equal(t, attrsession.SessionID("session-A"), id)
 }
 
 func TestProduce_HeaderMode(t *testing.T) {
@@ -329,11 +351,18 @@ func TestPreRequestIgnoresEmptyResult(t *testing.T) {
 func TestBindingExpiresAfterTTL(t *testing.T) {
 	t.Parallel()
 
-	producer := mustFactory(t, `{"headerName":"x-session-id","ttl":"50ms"}`)
+	// Use a 10x margin between TTL and the wait so CI scheduler jitter or
+	// a GC pause cannot keep the binding alive past the test's check.
+	// Eventually-style polling does not work here: Produce refreshes the
+	// TTL on a successful read, so a polling loop would prevent expiration.
+	const ttl = 100 * time.Millisecond
+	const wait = 1 * time.Second
+
+	producer := mustFactory(t, `{"headerName":"x-session-id","ttl":"`+ttl.String()+`"}`)
 	bind := requestWithSession("session-A")
 	producer.PreRequest(context.Background(), bind, schedulingResultFor(endpointFor("pod-1", "10.0.0.1")))
 
-	time.Sleep(120 * time.Millisecond)
+	time.Sleep(wait)
 
 	lookup := requestWithSession("session-A")
 	require.NoError(t, producer.Produce(context.Background(), lookup, nil))
@@ -342,6 +371,32 @@ func TestBindingExpiresAfterTTL(t *testing.T) {
 		attrsession.BoundEndpointDataKey.WithNonEmptyProducerName("session-id-producer").String(),
 	)
 	assert.False(t, ok, "binding should have expired")
+}
+
+func TestBindingRefreshedOnProduce(t *testing.T) {
+	t.Parallel()
+
+	// Each sleep is well inside the TTL (single-step margin = 400ms), but
+	// the two sleeps together exceed the TTL by 200ms — so the lookup
+	// passes only if the intermediate Produce refreshed the entry.
+	const ttl = 1 * time.Second
+	const step = 600 * time.Millisecond
+
+	producer := mustFactory(t, `{"headerName":"x-session-id","ttl":"`+ttl.String()+`"}`)
+	bind := requestWithSession("session-A")
+	producer.PreRequest(context.Background(), bind, schedulingResultFor(endpointFor("pod-1", "10.0.0.1")))
+
+	time.Sleep(step)
+	require.NoError(t, producer.Produce(context.Background(), requestWithSession("session-A"), nil))
+
+	time.Sleep(step)
+	lookup := requestWithSession("session-A")
+	require.NoError(t, producer.Produce(context.Background(), lookup, nil))
+	_, ok := fwksched.ReadRequestAttribute[attrsession.BoundEndpoint](
+		lookup,
+		attrsession.BoundEndpointDataKey.WithNonEmptyProducerName("session-id-producer").String(),
+	)
+	assert.True(t, ok, "binding should still be present: read refreshed the TTL")
 }
 
 func TestBindingsEvictedAtCapacity(t *testing.T) {

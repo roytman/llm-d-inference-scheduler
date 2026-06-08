@@ -78,7 +78,7 @@ var (
 	loadRenderImage  = env.GetEnvBool("LOAD_VLLM_RENDER_IMAGE", true, ginkgo.GinkgoLogr)
 	// hfCacheHostPath, when non-empty, is bind-mounted into the kind node at
 	// /opt/hf-cache and used as a hostPath for the render sidecar's
-	// /root/.cache/huggingface, so weights survive across CI runs.
+	// /root/.cache/huggingface, so tokenizer/config files survive across CI runs
 	hfCacheHostPath = env.GetEnvString("HF_CACHE_HOST_PATH", "", ginkgo.GinkgoLogr)
 	// nsName is the namespace in which the K8S objects will be created
 	nsName = env.GetEnvString("NAMESPACE", "default", ginkgo.GinkgoLogr)
@@ -379,8 +379,8 @@ nodes:
 `
 
 // extraMountsBlock returns a YAML fragment to splice under the kind node when a
-// HuggingFace weights cache is provided. The host path is bind-mounted into the
-// kind node at hfCacheNodePath; setup_test.go points the render sidecar's
+// HuggingFace cache directory is provided. The host path is bind-mounted into
+// the kind node at hfCacheNodePath; setup_test.go points the render sidecar's
 // model-cache volume at the same node path. Paths are quoted so YAML-significant
 // characters (e.g. ':' on Windows-style paths) cannot break parsing.
 func extraMountsBlock(hostPath string) string {

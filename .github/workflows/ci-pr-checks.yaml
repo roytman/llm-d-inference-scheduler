@@ -442,11 +442,12 @@ jobs:
             docker load --input "$image"
           done
 
-      # HuggingFace weights cache. Only the renderer-using suite touches the
-      # cache key, so parallel matrix entries cannot race to save an empty
-      # directory under the same key. Bump the trailing -vN when kvModelName
-      # in test/e2e/e2e_suite_test.go changes; otherwise stale weights are
-      # served.
+      # HuggingFace runtime cache (tokenizer + configs; render mode does not
+      # load weights). Only the renderer-using suite touches the cache key, so
+      # parallel matrix entries cannot race to save an empty directory under
+      # the same key. Bump the trailing -vN when kvModelName in
+      # test/e2e/e2e_suite_test.go changes; otherwise the stale tokenizer
+      # files are served.
       - name: Create HF cache dir
         if: ${{ matrix.suite.needs-renderer == 'true' }}
         id: hf-cache
@@ -455,7 +456,7 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/hf-cache"
           echo "path=${RUNNER_TEMP}/hf-cache" >> "$GITHUB_OUTPUT"
 
-      - name: Cache HuggingFace weights
+      - name: Cache HuggingFace files
         if: ${{ matrix.suite.needs-renderer == 'true' }}
         uses: actions/cache@v5
         with:

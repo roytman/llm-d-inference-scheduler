@@ -6,16 +6,17 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/assert"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
-	sessionaffinity "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/sessionaffinity"
+	sessionaffinity "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/sessionaffinity"
 	"github.com/llm-d/llm-d-router/test/utils"
 )
 
-func TestSessionAffinity_Score(t *testing.T) {
+func TestSessionAffinity_Filter(t *testing.T) {
 	endpointA := scheduling.NewEndpoint(
 		&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod-a"}},
 		&fwkdl.Metrics{},
@@ -31,96 +32,93 @@ func TestSessionAffinity_Score(t *testing.T) {
 
 	// valid session token for endpointB
 	validSessionTokenForEndpointB := base64.StdEncoding.EncodeToString([]byte(endpointB.GetMetadata().NamespacedName.String()))
+	// valid token whose pod is not among the candidates
+	tokenForMissingPod := base64.StdEncoding.EncodeToString([]byte("pod-missing"))
 
-	sessionAffinityScorer := sessionaffinity.NewSessionAffinity("")
-	customHeaderScorer := sessionaffinity.NewSessionAffinity("x-custom-session")
+	sessionAffinityFilter := sessionaffinity.NewSessionAffinity("")
+	customHeaderFilter := sessionaffinity.NewSessionAffinity("x-custom-session")
 
 	tests := []struct {
-		name       string
-		scorer     *sessionaffinity.SessionAffinity
-		req        *scheduling.InferenceRequest
-		input      []scheduling.Endpoint
-		wantScores map[scheduling.Endpoint]float64
+		name     string
+		filter   *sessionaffinity.SessionAffinity
+		req      *scheduling.InferenceRequest
+		input    []scheduling.Endpoint
+		wantPods []string
 	}{
 		{
-			name:   "selects correct endpoint : endpointB",
-			scorer: sessionAffinityScorer,
+			name:   "selects the session endpoint : endpointB",
+			filter: sessionAffinityFilter,
 			req: &scheduling.InferenceRequest{
 				Headers: map[string]string{"x-session-token": validSessionTokenForEndpointB},
 			},
-			input: inputEndpoints,
-			wantScores: map[scheduling.Endpoint]float64{
-				endpointA: 0.0,
-				endpointB: 1.0,
-			},
+			input:    inputEndpoints,
+			wantPods: []string{"pod-b"},
 		},
 		{
-			name:   "custom header selects endpointB",
-			scorer: customHeaderScorer,
+			name:   "custom header selects the session endpoint : endpointB",
+			filter: customHeaderFilter,
 			req: &scheduling.InferenceRequest{
 				Headers: map[string]string{"x-custom-session": validSessionTokenForEndpointB},
 			},
-			input: inputEndpoints,
-			wantScores: map[scheduling.Endpoint]float64{
-				endpointA: 0.0,
-				endpointB: 1.0,
-			},
+			input:    inputEndpoints,
+			wantPods: []string{"pod-b"},
 		},
 		{
 			name:   "custom header ignores default header",
-			scorer: customHeaderScorer,
+			filter: customHeaderFilter,
 			req: &scheduling.InferenceRequest{
 				Headers: map[string]string{"x-session-token": validSessionTokenForEndpointB},
 			},
-			input: inputEndpoints,
-			wantScores: map[scheduling.Endpoint]float64{
-				endpointA: 0.0,
-				endpointB: 0.0,
-			},
+			input:    inputEndpoints,
+			wantPods: []string{"pod-a", "pod-b"},
 		},
 		{
-			name:   "no session token",
-			scorer: sessionAffinityScorer,
+			name:   "no session token returns all endpoints",
+			filter: sessionAffinityFilter,
 			req: &scheduling.InferenceRequest{
 				Headers: map[string]string{},
 			},
-			// both endpoints get score 0.0
-			input: inputEndpoints,
-			wantScores: map[scheduling.Endpoint]float64{
-				endpointA: 0.0,
-				endpointB: 0.0,
-			},
+			input:    inputEndpoints,
+			wantPods: []string{"pod-a", "pod-b"},
 		},
 		{
-			name:   "invalid session token",
-			scorer: sessionAffinityScorer,
+			name:   "invalid session token returns all endpoints",
+			filter: sessionAffinityFilter,
 			req: &scheduling.InferenceRequest{
 				Headers: map[string]string{"x-session-token": "garbage-token"},
 			},
-			// expect same behavior as no session token
-			input: inputEndpoints,
-			wantScores: map[scheduling.Endpoint]float64{
-				endpointA: 0.0,
-				endpointB: 0.0,
-			},
+			input:    inputEndpoints,
+			wantPods: []string{"pod-a", "pod-b"},
 		},
 		{
-			name:   "no endpoints available",
-			scorer: sessionAffinityScorer,
-			req:    &scheduling.InferenceRequest{},
-			input:  []scheduling.Endpoint{},
-			// returns empty score map
-			wantScores: map[scheduling.Endpoint]float64{},
+			name:   "session pod not among candidates returns all endpoints",
+			filter: sessionAffinityFilter,
+			req: &scheduling.InferenceRequest{
+				Headers: map[string]string{"x-session-token": tokenForMissingPod},
+			},
+			input:    inputEndpoints,
+			wantPods: []string{"pod-a", "pod-b"},
+		},
+		{
+			name:     "no endpoints available",
+			filter:   sessionAffinityFilter,
+			req:      &scheduling.InferenceRequest{Headers: map[string]string{"x-session-token": validSessionTokenForEndpointB}},
+			input:    []scheduling.Endpoint{},
+			wantPods: []string{},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			gotScores := test.scorer.Score(context.Background(), test.req, test.input)
+			got := test.filter.Filter(context.Background(), test.req, test.input)
 
-			if diff := cmp.Diff(test.wantScores, gotScores); diff != "" {
-				t.Errorf("Unexpected output (-want +got): %v", diff)
+			gotPods := make([]string, len(got))
+			for idx, endpoint := range got {
+				gotPods[idx] = endpoint.GetMetadata().NamespacedName.Name
 			}
+
+			assert.ElementsMatch(t, test.wantPods, gotPods, "filtered endpoints should match expected endpoints")
+			assert.Len(t, got, len(test.wantPods), "filtered endpoints count should match expected count")
 		})
 	}
 }

@@ -24,11 +24,10 @@ import (
 	"github.com/stretchr/testify/require"
 
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
+	sessionutil "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/util/sessionaffinity"
 	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 	integration "github.com/llm-d/llm-d-router/test/integration"
 )
-
-const sessionTokenHeader = "x-session-token"
 
 // TestSessionAffinityFilter_RequestFlow validates the end-to-end session
 // affinity flow against an EPP initialized from text config: the first request
@@ -91,7 +90,7 @@ func sendSessionRequest(t *testing.T, h *TestHarness, sessionToken string) (endp
 		reqcommon.RequestIDHeaderKey: "session-req",
 	}
 	if sessionToken != "" {
-		reqHeaders[sessionTokenHeader] = sessionToken
+		reqHeaders[sessionutil.DefaultHeader] = sessionToken
 	}
 
 	requests := integration.ReqRaw(reqHeaders, `{"model":"`+modelMyModel+`","prompt":"hello","max_tokens":10,"temperature":0}`)
@@ -112,7 +111,7 @@ func sendSessionRequest(t *testing.T, h *TestHarness, sessionToken string) (endp
 	endpoint = headerValue(responses[0].GetRequestHeaders().GetResponse().GetHeaderMutation().GetSetHeaders(), metadata.DestinationEndpointKey)
 	require.NotEmpty(t, endpoint, "request headers response must set the destination endpoint")
 
-	token = headerValue(responses[2].GetResponseHeaders().GetResponse().GetHeaderMutation().GetSetHeaders(), sessionTokenHeader)
+	token = headerValue(responses[2].GetResponseHeaders().GetResponse().GetHeaderMutation().GetSetHeaders(), sessionutil.DefaultHeader)
 	return endpoint, token
 }
 

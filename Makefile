@@ -41,6 +41,11 @@ export VLLM_IMAGE ?= $(VLLM_SIMULATOR_TAG_BASE):$(VLLM_SIMULATOR_TAG)
 # plugin's HTTP backend.
 export VLLM_RENDER_IMAGE ?= vllm/vllm-openai-cpu:v0.21.0
 
+# Model used by the e2e renderer/KV tests. Single source of truth: the CI
+# workflow reads this via `make -s print-hf-model-name` to key the
+# HuggingFace cache; the Go suite reads it from HF_MODEL_NAME at runtime.
+export HF_MODEL_NAME ?= Qwen/Qwen2.5-1.5B-Instruct
+
 BUILDER_TAG ?= dev
 BUILDER_TAG_BASE ?= $(IMAGE_REGISTRY)/$(BUILDER_IMAGE_NAME)
 export BUILDER_IMAGE ?= $(BUILDER_TAG_BASE):$(BUILDER_TAG)
@@ -481,6 +486,7 @@ env: ## Print environment variables
 	@echo "VLLM_IMAGE=$(VLLM_IMAGE)"
 	@echo "VLLM_RENDER_IMAGE=$(VLLM_RENDER_IMAGE)"
 	@echo "BUILDER_IMAGE=$(BUILDER_IMAGE)"
+	@echo "HF_MODEL_NAME=$(HF_MODEL_NAME)"
 
 .PHONY: print-namespace
 print-namespace: ## Print the current namespace
@@ -489,6 +495,10 @@ print-namespace: ## Print the current namespace
 .PHONY: print-project-name
 print-project-name: ## Print the current project name
 	@echo "$(PROJECT_NAME)"
+
+.PHONY: print-hf-model-name
+print-hf-model-name: ## Print the HuggingFace model name for the e2e renderer suite
+	@echo "$(HF_MODEL_NAME)"
 
 ##@ Deprecated aliases for backwards compatibility
 .PHONY: install-docker

@@ -373,12 +373,6 @@ jobs:
     if: ${{ needs.check-changes.outputs.src == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      # Single source of truth for the model name. Consumed by the HF cache
-      # key below and by the test step (forwarded into the Go suite as
-      # HF_MODEL_NAME). The Go fallback default in
-      # test/e2e/e2e_suite_test.go must be updated alongside this value.
-      HF_MODEL_NAME: Qwen/Qwen2.5-1.5B-Instruct
     strategy:
       fail-fast: false
       matrix:
@@ -451,9 +445,15 @@ jobs:
       # HuggingFace runtime cache (tokenizer + configs; render mode does not
       # load weights). Only the renderer-using suite touches the cache key, so
       # parallel matrix entries cannot race to save an empty directory under
-      # the same key. The model name comes from the job-level HF_MODEL_NAME
-      # env so changing it auto-busts the cache; the trailing -vN is a manual
-      # lever for forced re-population without changing the model.
+      # the same key. The model name comes from the Makefile (single source
+      # of truth) so changing it auto-busts the cache; the trailing -vN is
+      # a manual lever for forced re-population without changing the model.
+      - name: Resolve HF model name
+        if: ${{ matrix.suite.needs-renderer == 'true' }}
+        id: model
+        shell: bash
+        run: echo "name=$(make -s print-hf-model-name)" >> "$GITHUB_OUTPUT"
+
       - name: Create HF cache dir
         if: ${{ matrix.suite.needs-renderer == 'true' }}
         id: hf-cache
@@ -467,9 +467,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ steps.hf-cache.outputs.path }}
-          key: hf-cache-${{ runner.os }}-${{ env.HF_MODEL_NAME }}-v2
+          key: hf-cache-${{ runner.os }}-${{ steps.model.outputs.name }}-v2
           restore-keys: |
-            hf-cache-${{ runner.os }}-
+            hf-cache-${{ runner.os }}-${{ steps.model.outputs.name }}-
 
       - name: Run e2e-router (${{ matrix.suite.name }})
         shell: bash

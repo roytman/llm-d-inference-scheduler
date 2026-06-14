@@ -74,10 +74,12 @@ var (
 	sideCarImage     = env.GetEnvString("SIDECAR_IMAGE", "ghcr.io/llm-d/llm-d-router-disagg-sidecar:dev", ginkgo.GinkgoLogr)
 	vllmRenderImage  = env.GetEnvString("VLLM_RENDER_IMAGE", "vllm/vllm-openai-cpu:v0.21.0", ginkgo.GinkgoLogr)
 	loadRenderImage  = env.GetEnvBool("LOAD_VLLM_RENDER_IMAGE", true, ginkgo.GinkgoLogr)
-	// kvModelName is the model name used in KV tests. The CI workflow sets
-	// HF_MODEL_NAME and uses the same value to key the HuggingFace cache, so
-	// the two stay in sync there. The fallback is for local dev.
-	kvModelName = env.GetEnvString("HF_MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct", ginkgo.GinkgoLogr)
+	// kvModelName is the model name used in KV tests. The canonical value
+	// lives in the Makefile (HF_MODEL_NAME ?= ...), is forwarded into this
+	// process via E2E_ENV_VARS, and is read here. Running the e2e suite
+	// outside `make test-e2e-scheduler` requires setting HF_MODEL_NAME by
+	// hand.
+	kvModelName = env.GetEnvString("HF_MODEL_NAME", "", ginkgo.GinkgoLogr)
 	// hfCacheHostPath, when non-empty, is bind-mounted into the kind node at
 	// /opt/hf-cache and used as a hostPath for the render sidecar's
 	// /root/.cache/huggingface, so tokenizer/config files survive across CI runs

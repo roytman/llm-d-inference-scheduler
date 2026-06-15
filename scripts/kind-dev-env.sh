@@ -198,19 +198,6 @@ for cmd in kind kubectl ${CONTAINER_RUNTIME}; do
     fi
 done
 
-# Prometheus config-reloader needs sufficient inotify resources
-if [ "${PROM_ENABLED}" == "true" ]; then
-  INOTIFY_INSTANCES=$(cat /proc/sys/fs/inotify/max_user_instances)
-  if [ "${INOTIFY_INSTANCES}" -lt 512 ]; then
-    echo "Error: fs.inotify.max_user_instances is ${INOTIFY_INSTANCES} (need >= 512) for Prometheus."
-    echo ""
-    echo "  sudo sysctl -w fs.inotify.max_user_instances=512"
-    echo ""
-    echo "To persist: echo 'fs.inotify.max_user_instances=512' | sudo tee /etc/sysctl.d/99-inotify.conf"
-    exit 1
-  fi
-fi
-
 # TARGET_PORTS is substituted directly into the `targetPorts: ${TARGET_PORTS}` field
 # in deploy/components/inference-gateway/inference-pools.yaml. Each item must be
 # indented with exactly 2 spaces to match the indentation of that field. If the
@@ -264,6 +251,25 @@ set -x
 # Hotfix for https://github.com/kubernetes-sigs/kind/issues/3880
 CONTAINER_NAME="${CLUSTER_NAME}-control-plane"
 ${CONTAINER_RUNTIME} exec ${CONTAINER_NAME} /bin/bash -c "sysctl net.ipv4.conf.all.arp_ignore=0"
+
+# Prometheus config-reloader needs sufficient inotify resources. The limit that
+# applies to pods is the one in the kernel of the kind node, which is the host
+# kernel on Linux and the runtime VM kernel on macOS; reading it from inside the
+# node container is correct in both cases.
+if [ "${PROM_ENABLED}" == "true" ]; then
+  INOTIFY_INSTANCES=$(${CONTAINER_RUNTIME} exec ${CONTAINER_NAME} cat /proc/sys/fs/inotify/max_user_instances)
+  if [ "${INOTIFY_INSTANCES}" -lt 512 ]; then
+    echo "Error: fs.inotify.max_user_instances is ${INOTIFY_INSTANCES} (need >= 512) for Prometheus."
+    echo ""
+    echo "Raise it on the kind node's kernel. On Linux this is the host:"
+    echo "  sudo sysctl -w fs.inotify.max_user_instances=512"
+    echo "To persist: echo 'fs.inotify.max_user_instances=512' | sudo tee /etc/sysctl.d/99-inotify.conf"
+    echo ""
+    echo "On macOS the kind node runs in the container runtime VM; raise it there, e.g.:"
+    echo "  ${CONTAINER_RUNTIME} exec ${CONTAINER_NAME} sysctl -w fs.inotify.max_user_instances=512"
+    exit 1
+  fi
+fi
 
 # Wait for all pods to be ready
 kubectl --context ${KUBE_CONTEXT} -n kube-system wait --for=condition=Ready --all pods --timeout=300s

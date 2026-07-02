@@ -39,8 +39,9 @@ var ErrBadRequest = errors.New("bad request")
 // UpstreamError carries the HTTP status a step received from an upstream
 // service (render, gateway). The server forwards a 4xx status to the client
 // (the request was the root cause) and treats 5xx as a 502 gateway fault.
-// Body holds the upstream response for server-side logging only; it is not
-// sent to the client.
+// Body holds the upstream response for programmatic inspection only; it is
+// kept out of Error() (which may be logged) and off the client response, since
+// it can carry prompt or user data.
 type UpstreamError struct {
 	Step       string
 	StatusCode int
@@ -48,7 +49,7 @@ type UpstreamError struct {
 }
 
 func (e *UpstreamError) Error() string {
-	return fmt.Sprintf("%s: upstream returned HTTP %d: %s", e.Step, e.StatusCode, e.Body)
+	return fmt.Sprintf("%s: upstream returned HTTP %d", e.Step, e.StatusCode)
 }
 
 // Pipeline orchestrates the sequential execution of steps.

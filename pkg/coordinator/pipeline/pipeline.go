@@ -70,26 +70,26 @@ func (p *Pipeline) Execute(ctx context.Context, reqCtx *RequestContext) error {
 		name     string
 		duration time.Duration
 	}
-	timings := make([]stepTiming, 0, len(p.steps)+1)
-	if reqCtx.ParseDuration > 0 {
-		timings = append(timings, stepTiming{name: "parse", duration: reqCtx.ParseDuration})
-	}
+	timings := make([]stepTiming, len(p.steps))
 	defer func() {
-		stats := make([]any, 0, len(timings)*2)
+		stats := make([]any, 0, (len(timings)+1)*2)
+		if reqCtx.ParseDuration > 0 {
+			stats = append(stats, "parse", reqCtx.ParseDuration.String())
+		}
 		for _, t := range timings {
 			stats = append(stats, t.name, t.duration.String())
 		}
 		logger.V(logutil.DEFAULT).Info("pipeline step timings", stats...)
 	}()
 
-	for _, step := range p.steps {
+	for idx, step := range p.steps {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("pipeline cancelled: %w", err)
 		}
 		logger.V(logutil.TRACE).Info("step starting", "step", step.Name())
 		start := time.Now()
 		err := step.Execute(ctx, reqCtx)
-		timings = append(timings, stepTiming{name: step.Name(), duration: time.Since(start)})
+		timings[idx] = stepTiming{name: step.Name(), duration: time.Since(start)}
 		if err != nil {
 			if errors.Is(err, ErrPipelineDone) {
 				return nil

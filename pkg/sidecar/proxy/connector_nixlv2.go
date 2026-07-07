@@ -70,6 +70,15 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	}
 	uuidStr := uuid.String()
 
+	// correlationID ties the encode, prefill, and decode timing logs together
+	// without touching the wire ids (transfer_id, dp-rank, forwarded
+	// x-request-id): it is the caller's x-request-id when set, else this
+	// request's own UUID. Logging only.
+	correlationID := r.Header.Get(requestHeaderRequestID)
+	if correlationID == "" {
+		correlationID = uuidStr
+	}
+
 	// Parallel-dispatch path synthesises decode's kv_transfer_params from config
 	// instead of the prefill response. The serial path below is unchanged when off.
 	if s.config.MoRIIOParallelDispatch && s.config.MoRIIOWriteMode {
@@ -408,22 +417,33 @@ retryLoop:
 	decodeDuration := time.Since(decodeStart)
 	decodeSpan.SetAttributes(attribute.Float64("llm_d.pd_proxy.decode.duration_ms", float64(decodeDuration.Milliseconds())))
 
-	// Calculate end-to-end P/D timing metrics.
-	// True TTFT captures time from gateway request start to decode start, including
-	// gateway routing, scheduling, prefill, and coordination overhead that
-	// per-instance vLLM metrics miss.
+	// End-to-end P/D timing. True TTFT is gateway request start to decode start,
+	// including gateway routing, scheduling, prefill, and coordination overhead
+	// that per-instance vLLM metrics miss; coordinator overhead is the gap
+	// between the prefill and decode legs. Computed outside the span guard so the
+	// log emits even when tracing is disabled.
+	var totalDuration, trueTTFT time.Duration
+	if requestStart, ok := ctx.Value(requestStartTimeKey).(time.Time); ok {
+		totalDuration = time.Since(requestStart)
+		trueTTFT = decodeStart.Sub(requestStart)
+	}
+	coordinatorOverhead := decodeStart.Sub(prefillStart.Add(prefillDuration))
+
+	// One timing line per request. encode_ms is present only when the request
+	// went through the encoder (EPD) stage.
+	kv := []any{"request_id", correlationID}
+	if encodeDuration, ok := ctx.Value(encodeDurationKey).(time.Duration); ok {
+		kv = append(kv, "encode_ms", encodeDuration.Milliseconds())
+	}
+	kv = append(kv,
+		"prefill_ms", prefillDuration.Milliseconds(),
+		"decode_ms", decodeDuration.Milliseconds(),
+		"coordinator_overhead_ms", coordinatorOverhead.Milliseconds(),
+		"true_ttft_ms", trueTTFT.Milliseconds(),
+		"total_ms", totalDuration.Milliseconds())
+	s.logger.Info("request timing", kv...)
+
 	if currentSpan := trace.SpanFromContext(ctx); currentSpan.SpanContext().IsValid() {
-		var totalDuration time.Duration
-		var trueTTFT time.Duration
-		if requestStartValue := ctx.Value(requestStartTimeKey); requestStartValue != nil {
-			if requestStart, ok := requestStartValue.(time.Time); ok {
-				totalDuration = time.Since(requestStart)
-				trueTTFT = decodeStart.Sub(requestStart)
-			}
-		}
-
-		coordinatorOverhead := decodeStart.Sub(prefillStart.Add(prefillDuration))
-
 		currentSpan.SetAttributes(
 			attribute.Float64("llm_d.pd_proxy.total_duration_ms", float64(totalDuration.Milliseconds())),
 			attribute.Float64("llm_d.pd_proxy.true_ttft_ms", float64(trueTTFT.Milliseconds())),

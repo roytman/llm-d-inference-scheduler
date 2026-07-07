@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	logging "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
@@ -102,7 +103,11 @@ func (s *Server) handleECNIXL(w http.ResponseWriter, r *http.Request, prefillEnd
 
 	// Step 1: fan out to encoders, collect per-image ec_transfer_params.
 	if len(encodeEndPoints) > 0 {
+		encodeStart := time.Now()
 		params, contributed, total, err := s.fanoutEncoderCollect(r.Context(), completionRequest, encodeEndPoints, requestID)
+		// Hand the encoder duration to the P/D connector so it lands on the
+		// single per-request timing line at the end of processing.
+		r = r.WithContext(context.WithValue(r.Context(), encodeDurationKey, time.Since(encodeStart)))
 		if err != nil {
 			s.logger.Error(err, "encoder processing failed", "requestID", requestID)
 			if err := errorBadGateway(err, w); err != nil {

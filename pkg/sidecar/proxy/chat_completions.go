@@ -35,6 +35,10 @@ type contextKey string
 
 const requestStartTimeKey contextKey = "request_start_time"
 
+// encodeDurationKey carries the encoder-stage duration from the EC handler to
+// the P/D connector so the whole request logs its per-stage timing on one line.
+const encodeDurationKey contextKey = "encode_duration"
+
 const (
 	// ChatCompletionsPath is the OpenAI chat completions path
 	ChatCompletionsPath = "/v1/chat/completions"

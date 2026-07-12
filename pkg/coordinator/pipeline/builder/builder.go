@@ -63,7 +63,7 @@ func Build(cfg *config.Config, gwClient *gateway.Client) ([]pipeline.Step, error
 		return nil, err
 	}
 
-	var steps []pipeline.Step
+	var pipelineSteps []pipeline.Step
 	for _, stepCfg := range cfg.Pipeline.Steps {
 		params := mergeConnectorDefaults(stepCfg.Params, cfg.Pipeline.KVConnector, cfg.Pipeline.ECConnector)
 		if _, ok := params["use_openai_format"]; !ok {
@@ -74,7 +74,7 @@ func Build(cfg *config.Config, gwClient *gateway.Client) ([]pipeline.Step, error
 			return nil, err
 		}
 
-		steps = append(steps, step)
+		pipelineSteps = append(pipelineSteps, step)
 	}
-	return steps, nil
+	return pipelineSteps, nil
 }

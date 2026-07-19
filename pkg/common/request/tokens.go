@@ -27,7 +27,7 @@ const (
 // non-streaming, single-output-token chat-completions request derived from
 // original (which may be the same map as target). max_tokens is always
 // capped to 1; max_completion_tokens is only added when original already
-// carries it, since the OpenAI API rejects requests that set both.
+// carries it, and leaves it untached otherwise.
 func PrimeSingleTokenRequest(target, original map[string]any) {
 	target[FieldMaxTokens] = 1
 	if _, ok := original[FieldMaxCompletionTokens]; ok {

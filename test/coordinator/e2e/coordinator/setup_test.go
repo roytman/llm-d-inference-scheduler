@@ -81,41 +81,31 @@ func createCRDs() {
 }
 
 // createEndPointPicker creates the scheduling ConfigMap and EPP Deployment (plus
-// its ServiceAccount, RoleBinding, and Service) for the given phase from the
-// supplied EPP config and waits for the EPP Deployment to become ready. Returns
-// the created object ids for cleanup.
-func createEndPointPicker(phase, config string) []string {
-	manifest := map[string]string{
-		"encode":  encodeEPPManifest,
-		"prefill": prefillEPPManifest,
-		"decode":  decodeEPPManifest,
-	}[phase]
-
-	cmName := "epp-config-" + phase
+// its ServiceAccount, RoleBinding, and Service) from the supplied EPP config and
+// waits for the EPP Deployment to become ready. Returns the created object ids
+// for cleanup.
+func createEndPointPicker(config string) []string {
+	const cmName = "epp-config"
 	createEPPConfigMap(cmName, config)
 
 	objects := make([]string, 1, 8)
 	objects[0] = "ConfigMap/" + cmName
-	objects = append(objects, applyManifest(manifest, eppSubstitutions())...)
+	objects = append(objects, applyManifest(eppManifest, eppSubstitutions())...)
 	podsInDeploymentsReady(objects)
 	return objects
 }
 
-// createInferencePool creates the InferencePool for the given phase. When
-// toDelete is set, the existing pool is removed first so the test starts clean.
-func createInferencePool(phase string, toDelete bool) []string {
+// createInferencePool creates the InferencePool covering all three worker
+// roles. When toDelete is set, the existing pool is removed first so the test
+// starts clean.
+func createInferencePool(toDelete bool) []string {
 	nsName := getNamespace()
-	manifest := map[string]string{
-		"encode":  encodePoolManifest,
-		"prefill": prefillPoolManifest,
-		"decode":  decodePoolManifest,
-	}[phase]
 
 	if toDelete {
-		deletePoolIfExists(poolNameBase + "-" + phase)
+		deletePoolIfExists(poolNameBase)
 	}
 
-	docs := testutils.ReadYaml(manifest)
+	docs := testutils.ReadYaml(poolManifest)
 	docs = e2eutil.SubstituteMany(docs, eppSubstitutions())
 	return testutils.CreateObjsFromYaml(testConfig, docs, nsName)
 }

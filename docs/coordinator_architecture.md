@@ -82,11 +82,11 @@ absorb further processing modes as they are added.
 
 A client sends an inference request to the coordinator. The coordinator pre-processes the
 request (media download, tokenization) against side services, then makes one inference
-call per phase to the Inference Gateway. The Gateway consults the per-phase EPP
-(Encode / Prefill / Decode), which picks a vLLM pod from that phase's pool. State that
-must survive across phases (token IDs, multimodal hashes, KV/EC transfer descriptors)
-lives on a per-request context held by the coordinator, not in a sidecar on the decode
-pod.
+call per phase to the Inference Gateway. The Gateway consults a single EPP that covers
+one InferencePool spanning all three worker roles; the EPP runs the scheduling profile
+named by the call's phase and picks a vLLM pod from that role. State that must survive
+across phases (token IDs, multimodal hashes, KV/EC transfer descriptors) lives on a
+per-request context held by the coordinator, not in a sidecar on the decode pod.
 
 ```
         Client
@@ -100,12 +100,12 @@ pod.
           v
      Inference Gateway
           |  endpoint picker protocol
+          v
+          EPP                          (single endpoint picker, one scheduling
+          |                             profile per phase, selected by EPP-Phase)
           +-------------------+-------------------+
           v                   v                   v
-      Encode EPP          Prefill EPP         Decode EPP    (per-phase endpoint picker)
-          |                   |                   |
-          v                   v                   v
-      Encode vLLM         Prefill vLLM        Decode vLLM   (worker pools)
+      Encode vLLM         Prefill vLLM        Decode vLLM   (worker pools, one InferencePool)
         pool                pool                pool
 ```
 
@@ -208,19 +208,27 @@ paths can be added later as new protocols are supported.
 
 The Endpoint Picker (EPP) selects the concrete vLLM pod for a request through the GAIE
 [endpoint picker protocol](https://github.com/kubernetes-sigs/gateway-api-inference-extension/tree/main/docs/proposals/004-endpoint-picker-protocol). The coordinator never addresses pods directly: it sends each
-phase call to the configured gateway, and the per-phase EPP picks the pod from that
-phase's pool.
+phase call to the configured gateway, and the EPP picks the pod for that phase.
 
 ### Per-phase model
 
-Each Gateway route maps to a dedicated EPP instance configured for a single phase. The
-coordinator drives the cascade across phases; each EPP call is single-phase scheduling.
+One EPP instance and one InferencePool cover all three worker roles (encode, prefill,
+decode); the pods differ only by their `llm-d.ai/role` label. The Gateway routes every
+coordinator-to-worker call to that EPP, which runs the scheduling profile named by the
+call's `EPP-Phase` header (see [EPP-Phase routing](#epp-phase-routing)) via the
+`header-phase-profile-handler` plugin. The coordinator drives the cascade across phases;
+each EPP call is single-phase scheduling.
 
-| Phase | EPP instance | Role |
+| Phase | Scheduling profile | Role |
 | :---- | :---- | :---- |
-| `decode` | EPP-D | Selects a decode pod. Also evaluates whether the request needs disaggregation (encode and/or prefill). |
-| `prefill` | EPP-P | Selects a prefill pod. |
-| `encode` | EPP-E | Load-balances across encoder pods. |
+| `decode` | `decode` | Selects a decode pod. Also evaluates whether the request needs disaggregation (encode and/or prefill). |
+| `prefill` | `prefill` | Selects a prefill pod. |
+| `encode` | `encode` | Load-balances across encoder pods. |
+
+Each profile filters the shared pod pool down to its own role with a `by-label` role
+filter (`encode-filter`/`prefill-filter`/`decode-filter`); see
+[deploy/config/sim-e-p-d-epp-config.yaml](../deploy/config/sim-e-p-d-epp-config.yaml) for
+a full example configuration.
 
 This is an alternative to the sidecar-based orchestration in llm-d-router; see
 [Coordinator vs. the llm-d-router sidecar model](#coordinator-vs-the-llm-d-router-sidecar-model)
@@ -228,9 +236,9 @@ for the comparison.
 
 ### Decode disaggregation deciders
 
-EPP-D runs a scheduling cycle that, in addition to picking a decode pod, decides whether
-the request can be served by decode alone or needs earlier phases. The decision is made
-by decider plugins (EPP-side configuration):
+The `decode` profile runs a scheduling cycle that, in addition to picking a decode pod,
+decides whether the request can be served by decode alone or needs earlier phases. The
+decision is made by decider plugins (EPP-side configuration):
 
 | Decider | Stage | Logic |
 | :---- | :---- | :---- |

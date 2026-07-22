@@ -1,0 +1,238 @@
+/*
+Copyright 2026 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package headerphase
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+
+	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
+	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+)
+
+type fakeSchedulerProfile struct{}
+
+func (f *fakeSchedulerProfile) Run(_ context.Context, _ *fwksched.InferenceRequest, _ []fwksched.Endpoint) (*fwksched.ProfileRunResult, error) {
+	return &fwksched.ProfileRunResult{}, nil
+}
+
+func TestNewHeaderPhaseProfileHandler(t *testing.T) {
+	handler := NewHeaderPhaseProfileHandler(defaultHeaderName)
+
+	wantTypedName := fwkplugin.TypedName{
+		Type: HeaderPhaseProfileHandlerType,
+		Name: HeaderPhaseProfileHandlerType,
+	}
+	if diff := cmp.Diff(wantTypedName, handler.TypedName()); diff != "" {
+		t.Errorf("Unexpected TypedName (-want +got): %s", diff)
+	}
+}
+
+func TestHeaderPhaseProfileHandlerFactory(t *testing.T) {
+	tests := []struct {
+		name           string
+		rawParameters  string
+		wantHeaderName string
+	}{
+		{
+			name:           "no parameters, uses default header",
+			rawParameters:  "",
+			wantHeaderName: defaultHeaderName,
+		},
+		{
+			name:           "custom header name",
+			rawParameters:  `{"headerName": "x-phase"}`,
+			wantHeaderName: "x-phase",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var decoder *json.Decoder
+			if tt.rawParameters != "" {
+				decoder = json.NewDecoder(strings.NewReader(tt.rawParameters))
+			}
+
+			plugin, err := Factory("custom-name", decoder, nil)
+			if err != nil {
+				t.Fatalf("Factory() returned unexpected error: %v", err)
+			}
+
+			handler, ok := plugin.(*HeaderPhaseProfileHandler)
+			if !ok {
+				t.Fatalf("Expected *HeaderPhaseProfileHandler, got %T", plugin)
+			}
+
+			wantTypedName := fwkplugin.TypedName{
+				Type: HeaderPhaseProfileHandlerType,
+				Name: "custom-name",
+			}
+			if diff := cmp.Diff(wantTypedName, handler.TypedName()); diff != "" {
+				t.Errorf("Unexpected TypedName (-want +got): %s", diff)
+			}
+			if handler.headerName != tt.wantHeaderName {
+				t.Errorf("Expected headerName %q, got %q", tt.wantHeaderName, handler.headerName)
+			}
+		})
+	}
+}
+
+func TestHeaderPhaseWithName(t *testing.T) {
+	handler := NewHeaderPhaseProfileHandler(defaultHeaderName).WithName("renamed")
+
+	if handler.TypedName().Name != "renamed" {
+		t.Errorf("Expected Name to be %q, got %q", "renamed", handler.TypedName().Name)
+	}
+	if handler.TypedName().Type != HeaderPhaseProfileHandlerType {
+		t.Errorf("Expected Type to remain %q, got %q", HeaderPhaseProfileHandlerType, handler.TypedName().Type)
+	}
+}
+
+func TestHeaderPhasePick(t *testing.T) {
+	encodeProfile := &fakeSchedulerProfile{}
+	decodeProfile := &fakeSchedulerProfile{}
+	profiles := map[string]fwksched.SchedulerProfile{
+		"encode": encodeProfile,
+		"decode": decodeProfile,
+	}
+
+	tests := []struct {
+		name           string
+		request        *fwksched.InferenceRequest
+		profiles       map[string]fwksched.SchedulerProfile
+		profileResults map[string]*fwksched.ProfileRunResult
+		wantProfiles   map[string]fwksched.SchedulerProfile
+	}{
+		{
+			name:           "header names a configured profile, not yet run",
+			request:        &fwksched.InferenceRequest{Headers: map[string]string{defaultHeaderName: "encode"}},
+			profiles:       profiles,
+			profileResults: map[string]*fwksched.ProfileRunResult{},
+			wantProfiles:   map[string]fwksched.SchedulerProfile{"encode": encodeProfile},
+		},
+		{
+			name:     "selected profile already ran",
+			request:  &fwksched.InferenceRequest{Headers: map[string]string{defaultHeaderName: "encode"}},
+			profiles: profiles,
+			profileResults: map[string]*fwksched.ProfileRunResult{
+				"encode": {TargetEndpoints: nil},
+			},
+			wantProfiles: map[string]fwksched.SchedulerProfile{},
+		},
+		{
+			name:           "missing header",
+			request:        &fwksched.InferenceRequest{Headers: map[string]string{}},
+			profiles:       profiles,
+			profileResults: map[string]*fwksched.ProfileRunResult{},
+			wantProfiles:   map[string]fwksched.SchedulerProfile{},
+		},
+		{
+			name:           "header names an unconfigured profile",
+			request:        &fwksched.InferenceRequest{Headers: map[string]string{defaultHeaderName: "prefill"}},
+			profiles:       profiles,
+			profileResults: map[string]*fwksched.ProfileRunResult{},
+			wantProfiles:   map[string]fwksched.SchedulerProfile{},
+		},
+	}
+
+	handler := NewHeaderPhaseProfileHandler(defaultHeaderName)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := handler.Pick(context.Background(), tt.request, tt.profiles, tt.profileResults)
+			if len(got) != len(tt.wantProfiles) {
+				t.Errorf("Pick() returned %d profiles, want %d", len(got), len(tt.wantProfiles))
+			}
+			for name := range tt.wantProfiles {
+				if _, ok := got[name]; !ok {
+					t.Errorf("Pick() missing expected profile %q", name)
+				}
+			}
+		})
+	}
+}
+
+func TestHeaderPhaseProcessResults(t *testing.T) {
+	successResult := &fwksched.ProfileRunResult{
+		TargetEndpoints: nil,
+	}
+
+	tests := []struct {
+		name           string
+		profileResults map[string]*fwksched.ProfileRunResult
+		wantResult     *fwksched.SchedulingResult
+		wantErr        bool
+	}{
+		{
+			name: "single successful profile",
+			profileResults: map[string]*fwksched.ProfileRunResult{
+				"encode": successResult,
+			},
+			wantResult: &fwksched.SchedulingResult{
+				ProfileResults: map[string]*fwksched.ProfileRunResult{
+					"encode": successResult,
+				},
+				PrimaryProfileName: "encode",
+			},
+		},
+		{
+			name:           "no profiles selected returns error",
+			profileResults: map[string]*fwksched.ProfileRunResult{},
+			wantErr:        true,
+		},
+		{
+			name: "multiple profiles returns error",
+			profileResults: map[string]*fwksched.ProfileRunResult{
+				"encode": successResult,
+				"decode": successResult,
+			},
+			wantErr: true,
+		},
+		{
+			name: "nil result (profile execution failure) returns error",
+			profileResults: map[string]*fwksched.ProfileRunResult{
+				"encode": nil,
+			},
+			wantErr: true,
+		},
+	}
+
+	handler := NewHeaderPhaseProfileHandler(defaultHeaderName)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := handler.ProcessResults(context.Background(), nil, tt.profileResults)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ProcessResults() expected error, got nil")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("ProcessResults() unexpected error: %v", err)
+			}
+
+			if diff := cmp.Diff(tt.wantResult, got); diff != "" {
+				t.Errorf("Unexpected SchedulingResult (-want +got): %s", diff)
+			}
+		})
+	}
+}

@@ -28,6 +28,12 @@ import (
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 )
 
+// ingestedHeaderKey is the key request.Headers actually carries once the EPP's request
+// handler stores it (always lowercased, see pkg/epp/handlers/request.go). Handlers are
+// constructed with the mixed-case defaultHeaderName throughout these tests specifically
+// to exercise the constructor's normalization against this lowercase key.
+const ingestedHeaderKey = "epp-phase"
+
 type fakeSchedulerProfile struct{}
 
 func (f *fakeSchedulerProfile) Run(_ context.Context, _ *fwksched.InferenceRequest, _ []fwksched.Endpoint) (*fwksched.ProfileRunResult, error) {
@@ -53,14 +59,19 @@ func TestHeaderPhaseProfileHandlerFactory(t *testing.T) {
 		wantHeaderName string
 	}{
 		{
-			name:           "no parameters, uses default header",
+			name:           "no parameters, uses default header, normalized to lowercase",
 			rawParameters:  "",
-			wantHeaderName: defaultHeaderName,
+			wantHeaderName: ingestedHeaderKey,
 		},
 		{
 			name:           "custom header name",
 			rawParameters:  `{"headerName": "x-phase"}`,
 			wantHeaderName: "x-phase",
+		},
+		{
+			name:           "custom header name with mixed case and padding is normalized",
+			rawParameters:  `{"headerName": "  X-Custom-Phase  "}`,
+			wantHeaderName: "x-custom-phase",
 		},
 	}
 
@@ -123,14 +134,14 @@ func TestHeaderPhasePick(t *testing.T) {
 	}{
 		{
 			name:           "header names a configured profile, not yet run",
-			request:        &fwksched.InferenceRequest{Headers: map[string]string{defaultHeaderName: "encode"}},
+			request:        &fwksched.InferenceRequest{Headers: map[string]string{ingestedHeaderKey: "encode"}},
 			profiles:       profiles,
 			profileResults: map[string]*fwksched.ProfileRunResult{},
 			wantProfiles:   map[string]fwksched.SchedulerProfile{"encode": encodeProfile},
 		},
 		{
 			name:     "selected profile already ran",
-			request:  &fwksched.InferenceRequest{Headers: map[string]string{defaultHeaderName: "encode"}},
+			request:  &fwksched.InferenceRequest{Headers: map[string]string{ingestedHeaderKey: "encode"}},
 			profiles: profiles,
 			profileResults: map[string]*fwksched.ProfileRunResult{
 				"encode": {TargetEndpoints: nil},
@@ -146,7 +157,21 @@ func TestHeaderPhasePick(t *testing.T) {
 		},
 		{
 			name:           "header names an unconfigured profile",
-			request:        &fwksched.InferenceRequest{Headers: map[string]string{defaultHeaderName: "prefill"}},
+			request:        &fwksched.InferenceRequest{Headers: map[string]string{ingestedHeaderKey: "prefill"}},
+			profiles:       profiles,
+			profileResults: map[string]*fwksched.ProfileRunResult{},
+			wantProfiles:   map[string]fwksched.SchedulerProfile{},
+		},
+		{
+			name:           "header value has surrounding whitespace, still matches",
+			request:        &fwksched.InferenceRequest{Headers: map[string]string{ingestedHeaderKey: "  encode  "}},
+			profiles:       profiles,
+			profileResults: map[string]*fwksched.ProfileRunResult{},
+			wantProfiles:   map[string]fwksched.SchedulerProfile{"encode": encodeProfile},
+		},
+		{
+			name:           "whitespace-only header value is treated as missing",
+			request:        &fwksched.InferenceRequest{Headers: map[string]string{ingestedHeaderKey: "   "}},
 			profiles:       profiles,
 			profileResults: map[string]*fwksched.ProfileRunResult{},
 			wantProfiles:   map[string]fwksched.SchedulerProfile{},
@@ -199,21 +224,21 @@ func TestHeaderPhaseProcessResults(t *testing.T) {
 			request:         nil,
 			profileResults:  map[string]*fwksched.ProfileRunResult{},
 			wantErr:         true,
-			wantErrContains: `missing "EPP-Phase" header`,
+			wantErrContains: `missing "epp-phase" header`,
 		},
 		{
 			name:            "no profiles selected, empty header, reports missing header",
 			request:         &fwksched.InferenceRequest{Headers: map[string]string{}},
 			profileResults:  map[string]*fwksched.ProfileRunResult{},
 			wantErr:         true,
-			wantErrContains: `missing "EPP-Phase" header`,
+			wantErrContains: `missing "epp-phase" header`,
 		},
 		{
 			name:            "no profiles selected, unconfigured header value, reports the value",
-			request:         &fwksched.InferenceRequest{Headers: map[string]string{defaultHeaderName: "prefill"}},
+			request:         &fwksched.InferenceRequest{Headers: map[string]string{ingestedHeaderKey: "prefill"}},
 			profileResults:  map[string]*fwksched.ProfileRunResult{},
 			wantErr:         true,
-			wantErrContains: `no scheduling profile configured for "EPP-Phase" header value "prefill"`,
+			wantErrContains: `no scheduling profile configured for "epp-phase" header value "prefill"`,
 		},
 		{
 			name: "multiple profiles returns error",

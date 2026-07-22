@@ -52,7 +52,7 @@ absorb further processing modes as they are added.
   - [RequestContext](#requestcontext)
   - [EPP-Phase routing](#epp-phase-routing)
 - [EPP integration](#epp-integration)
-  - [Per-phase model](#per-phase-model)
+  - [Per-phase scheduling profiles](#per-phase-scheduling-profiles)
   - [Decode disaggregation deciders](#decode-disaggregation-deciders)
   - [Conditional decode handshake](#conditional-decode-handshake)
   - [KV and EC transfer protocols](#kv-and-ec-transfer-protocols)
@@ -210,7 +210,7 @@ The Endpoint Picker (EPP) selects the concrete vLLM pod for a request through th
 [endpoint picker protocol](https://github.com/kubernetes-sigs/gateway-api-inference-extension/tree/main/docs/proposals/004-endpoint-picker-protocol). The coordinator never addresses pods directly: it sends each
 phase call to the configured gateway, and the EPP picks the pod for that phase.
 
-### Per-phase model
+### Per-phase scheduling profiles
 
 One EPP instance and one InferencePool cover all three worker roles (encode, prefill,
 decode); the pods differ only by their `llm-d.ai/role` label. The Gateway routes every

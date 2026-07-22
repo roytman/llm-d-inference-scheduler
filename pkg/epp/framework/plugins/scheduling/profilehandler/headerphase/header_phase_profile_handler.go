@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -60,11 +61,14 @@ func Factory(name string, rawParameters *json.Decoder, _ fwkplugin.Handle) (fwkp
 	return NewHeaderPhaseProfileHandler(headerName).WithName(name), nil
 }
 
-// NewHeaderPhaseProfileHandler initializes a new HeaderPhaseProfileHandler and returns its pointer.
+// NewHeaderPhaseProfileHandler initializes a new HeaderPhaseProfileHandler and returns
+// its pointer. headerName is lowercased and trimmed: the EPP's request handler lowercases
+// every incoming header name at ingestion (pkg/epp/handlers/request.go), so the configured
+// name must be normalized the same way to match.
 func NewHeaderPhaseProfileHandler(headerName string) *HeaderPhaseProfileHandler {
 	return &HeaderPhaseProfileHandler{
 		typedName:  fwkplugin.TypedName{Type: HeaderPhaseProfileHandlerType, Name: HeaderPhaseProfileHandlerType},
-		headerName: headerName,
+		headerName: strings.ToLower(strings.TrimSpace(headerName)),
 	}
 }
 
@@ -89,18 +93,28 @@ func (h *HeaderPhaseProfileHandler) WithName(name string) *HeaderPhaseProfileHan
 	return h
 }
 
+// phaseHeader returns the trimmed value of the phase header, or "" when request is
+// nil or the header is absent or blank. Trimming avoids surprising lookup failures
+// when the header carries incidental leading/trailing whitespace.
+func (h *HeaderPhaseProfileHandler) phaseHeader(request *fwksched.InferenceRequest) string {
+	if request == nil {
+		return ""
+	}
+	return strings.TrimSpace(request.Headers[h.headerName])
+}
+
 // Pick selects the single SchedulingProfile named by the request's phase header. It
 // returns an empty map once that profile has run, or when the header is missing or
 // names a profile that isn't configured (ProcessResults then reports the error).
 func (h *HeaderPhaseProfileHandler) Pick(_ context.Context, request *fwksched.InferenceRequest, profiles map[string]fwksched.SchedulerProfile,
 	profileResults map[string]*fwksched.ProfileRunResult) map[string]fwksched.SchedulerProfile {
-	// ponytail: single profile per request; extend to loop over an ordered phase
-	// list parsed from the header for non-deferred multi-profile scheduling (#2135).
+	// TODO(#2135): single profile per request; extend to loop over an ordered phase
+	// list parsed from the header for non-deferred multi-profile scheduling.
 	if len(profileResults) > 0 { // the selected profile has already run
 		return map[string]fwksched.SchedulerProfile{}
 	}
 
-	phase := request.Headers[h.headerName]
+	phase := h.phaseHeader(request)
 	profile, ok := profiles[phase]
 	if !ok {
 		return map[string]fwksched.SchedulerProfile{}
@@ -114,15 +128,12 @@ func (h *HeaderPhaseProfileHandler) Pick(_ context.Context, request *fwksched.In
 // used to get the request's selected destination.
 func (h *HeaderPhaseProfileHandler) ProcessResults(_ context.Context, request *fwksched.InferenceRequest,
 	profileResults map[string]*fwksched.ProfileRunResult) (*fwksched.SchedulingResult, error) {
-	// ponytail: single profile per request; extend by re-parsing the header's
-	// ordered phase list to pick a primary among multiple results for
-	// non-deferred multi-profile scheduling (#2135).
+	// TODO(#2135): single profile per request; extend by re-parsing the header's
+	// ordered phase list to pick a primary among multiple results for non-deferred
+	// multi-profile scheduling.
 	switch len(profileResults) {
 	case 0:
-		var phase string
-		if request != nil {
-			phase = request.Headers[h.headerName]
-		}
+		phase := h.phaseHeader(request)
 		if phase == "" {
 			return nil, fmt.Errorf("header-phase profile handler: missing %q header", h.headerName)
 		}

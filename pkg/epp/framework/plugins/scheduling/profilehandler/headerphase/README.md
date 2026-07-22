@@ -9,8 +9,8 @@ each request is for, instead of needing one EPP instance per phase.
 
 ## What it does
 
-Reads the configured header from the incoming request and looks up a `schedulingProfile`
-with that exact name:
+Reads the configured header from the incoming request and looks up the
+`schedulingProfiles` entry with that exact name:
 
 - If a matching profile hasn't run yet, it runs that profile alone.
 - If the header is missing or names a profile that isn't configured, no profile runs and
@@ -25,7 +25,7 @@ profiles to run via decider plugins rather than a header.
 
 | Name | Type | Default | Description |
 |---|---|---|---|
-| `headerName` | string | `EPP-Phase` | Request header whose value names the scheduling profile to run. |
+| `headerName` | string | `EPP-Phase` | Request header whose value names the scheduling profile to run. Matched case-insensitively: the EPP lowercases every incoming header name, so this is normalized to lowercase regardless of how it's written here. |
 
 ### Example
 

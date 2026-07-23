@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -42,7 +42,7 @@ var _ fwksched.ProfileHandler = &HeaderPhaseProfileHandler{}
 // parameters configures the HeaderPhaseProfileHandler.
 type parameters struct {
 	// HeaderName is the request header whose value names the scheduling profile to run.
-	// Defaults to "EPP-Phase" when empty.
+	// Defaults to defaultHeaderName when empty.
 	HeaderName string `json:"headerName"`
 }
 
@@ -55,22 +55,24 @@ func Factory(name string, rawParameters *json.Decoder, _ fwkplugin.Handle) (fwkp
 		}
 	}
 
-	headerName := strings.TrimSpace(params.HeaderName)
-	if headerName == "" {
-		headerName = defaultHeaderName
-	}
-
-	return NewHeaderPhaseProfileHandler(headerName).WithName(name), nil
+	return NewHeaderPhaseProfileHandler(params.HeaderName).WithName(name), nil
 }
 
 // NewHeaderPhaseProfileHandler initializes a new HeaderPhaseProfileHandler and returns
-// its pointer. headerName is lowercased and trimmed: the EPP's request handler lowercases
-// every incoming header name at ingestion (pkg/epp/handlers/request.go), so the configured
-// name must be normalized the same way to match.
+// its pointer. headerName is lowercased and trimmed, falling back to defaultHeaderName
+// when that leaves it empty: the EPP's request handler lowercases every incoming header
+// name at ingestion (pkg/epp/handlers/request.go), so the configured name must be
+// normalized the same way to match, and an empty header key would never match any
+// request.
 func NewHeaderPhaseProfileHandler(headerName string) *HeaderPhaseProfileHandler {
+	headerName = strings.ToLower(strings.TrimSpace(headerName))
+	if headerName == "" {
+		headerName = strings.ToLower(defaultHeaderName)
+	}
+
 	return &HeaderPhaseProfileHandler{
 		typedName:  fwkplugin.TypedName{Type: HeaderPhaseProfileHandlerType, Name: HeaderPhaseProfileHandlerType},
-		headerName: strings.ToLower(strings.TrimSpace(headerName)),
+		headerName: headerName,
 	}
 }
 
@@ -117,9 +119,15 @@ func (h *HeaderPhaseProfileHandler) noMatchError(phase string) error {
 // Pick selects the single SchedulingProfile named by the request's phase header. It
 // returns an empty map once that profile has run, or when the header is missing or
 // names a profile that isn't configured. In the latter case the scheduler's run loop
-// (pkg/epp/scheduling.Scheduler.Schedule) stops without ever calling ProcessResults,
-// since no profile ever ran, so the specific reason is logged here rather than
-// returned from ProcessResults, where it would be unreachable in practice.
+// (pkg/epp/scheduling.Scheduler.Schedule) stops without ever calling ProcessResults, so
+// the specific reason is logged here rather than returned from ProcessResults, where it
+// would be unreachable. The client never sees that reason: it only gets the scheduler's
+// generic "failed to run any scheduler profile" error, which
+// pkg/epp/requestcontrol/director.go maps to a 429 ResourceExhausted response -
+// misleading, since a malformed or missing header is a client error, not a capacity
+// problem. Surfacing the real reason to the client needs a scheduler/ProfileHandler
+// contract change and is out of scope here; the log is a diagnostic aid for operators,
+// not an equivalent substitute for what the caller receives.
 func (h *HeaderPhaseProfileHandler) Pick(ctx context.Context, request *fwksched.InferenceRequest, profiles map[string]fwksched.SchedulerProfile,
 	profileResults map[string]*fwksched.ProfileRunResult) map[string]fwksched.SchedulerProfile {
 	// TODO(#2135): single profile per request; extend to loop over an ordered phase

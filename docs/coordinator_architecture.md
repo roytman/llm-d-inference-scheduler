@@ -131,8 +131,8 @@ multimodal item in parallel. The number and shape of these requests depend on th
 steps are enabled and how they are parameterized); text-only requests need no media
 download or encode at all. Across phases the coordinator sequences the round-trips
 (prefill and decode are one each), threading state from each response into the next
-request. Each Gateway call routes it by the `EPP-Phase` header to
-the matching per-phase EPP and then to a pod in that phase's pool.
+request. Each Gateway call routes it by the `EPP-Phase` header to the EPP, which runs
+the matching scheduling profile and picks a pod from that phase's pool.
 
 Steps are skipped at runtime when they do not apply (for example, `encode` is a no-op
 when the request has no multimodal entries, and `render` short-circuits when the
@@ -362,7 +362,7 @@ service in front of the Inference Gateway:
 | Pipeline versatility | Fixed E/P/D orchestration baked into the sidecar | Configurable pipeline of independent, reorderable plugin steps; new stages added without touching existing ones |
 | EPP scheduling | One cycle selects all phases (`disagg-profile-handler`) | One EPP call per phase, coordinator drives the cascade |
 | vLLM pod selection | All phase pods chosen up front in one scheduling cycle | Deferred per phase: each pod is selected only when that phase's call is made, at the point its destination becomes relevant |
-| Phase selection signal | EPP request headers `x-prefiller-host-port`, `x-encoder-hosts-ports` read by the sidecar | `EPP-Phase` header per call; per-phase EPP picks the pod |
+| Phase selection signal | EPP request headers `x-prefiller-host-port`, `x-encoder-hosts-ports` read by the sidecar | `EPP-Phase` header per call; the EPP runs the matching profile and picks the pod |
 | Tokenization | On the workers | Once, in the coordinator's render step; token IDs reused downstream (experimental path) |
 | Cross-phase state | Held by the sidecar | Held on the coordinator `RequestContext` |
 

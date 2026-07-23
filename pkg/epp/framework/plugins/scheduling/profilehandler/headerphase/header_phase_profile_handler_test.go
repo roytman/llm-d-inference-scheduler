@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -52,11 +52,22 @@ func TestNewHeaderPhaseProfileHandler(t *testing.T) {
 	}
 }
 
+func TestNewHeaderPhaseProfileHandlerEmptyFallsBackToDefault(t *testing.T) {
+	// The constructor itself must uphold the "never empty" invariant, independent of
+	// Factory: an empty headerName must not produce a handler that can never match any
+	// request (request.Headers[""] is always empty).
+	handler := NewHeaderPhaseProfileHandler("")
+	if handler.headerName != ingestedHeaderKey {
+		t.Errorf("Expected headerName %q, got %q", ingestedHeaderKey, handler.headerName)
+	}
+}
+
 func TestHeaderPhaseProfileHandlerFactory(t *testing.T) {
 	tests := []struct {
 		name           string
 		rawParameters  string
 		wantHeaderName string
+		wantErr        bool
 	}{
 		{
 			name:           "no parameters, uses default header, normalized to lowercase",
@@ -78,6 +89,11 @@ func TestHeaderPhaseProfileHandlerFactory(t *testing.T) {
 			rawParameters:  `{"headerName": "   "}`,
 			wantHeaderName: ingestedHeaderKey,
 		},
+		{
+			name:          "malformed json returns an error",
+			rawParameters: `{invalid}`,
+			wantErr:       true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -87,6 +103,12 @@ func TestHeaderPhaseProfileHandlerFactory(t *testing.T) {
 			decoder := fwkplugin.StrictDecoder(json.RawMessage(tt.rawParameters))
 
 			plugin, err := Factory("custom-name", decoder, nil)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("Factory() expected error, got nil")
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("Factory() returned unexpected error: %v", err)
 			}
@@ -213,6 +235,18 @@ func TestHeaderPhasePick(t *testing.T) {
 			profileResults: map[string]*fwksched.ProfileRunResult{},
 			wantProfiles:   map[string]fwksched.SchedulerProfile{},
 		},
+		{
+			// Unlike the header name, the header value is matched case-sensitively
+			// against the configured profile names: only the name gets normalized to
+			// match how the EPP's request handler stores it, since that's a fixed key
+			// this plugin controls, but the value is caller-supplied and compared
+			// verbatim against schedulingProfiles names.
+			name:           "header value case does not match the configured profile name",
+			request:        &fwksched.InferenceRequest{Headers: map[string]string{ingestedHeaderKey: "Encode"}},
+			profiles:       profiles,
+			profileResults: map[string]*fwksched.ProfileRunResult{},
+			wantProfiles:   map[string]fwksched.SchedulerProfile{},
+		},
 	}
 
 	handler := NewHeaderPhaseProfileHandler(defaultHeaderName)
@@ -283,14 +317,16 @@ func TestHeaderPhaseProcessResults(t *testing.T) {
 				"encode": successResult,
 				"decode": successResult,
 			},
-			wantErr: true,
+			wantErr:         true,
+			wantErrContains: "is intended to run a single profile per request, got 2",
 		},
 		{
 			name: "nil result (profile execution failure) returns error",
 			profileResults: map[string]*fwksched.ProfileRunResult{
 				"encode": nil,
 			},
-			wantErr: true,
+			wantErr:         true,
+			wantErrContains: "failed to run scheduler profile 'encode'",
 		},
 	}
 

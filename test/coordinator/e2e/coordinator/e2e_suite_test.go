@@ -76,7 +76,7 @@ var (
 	testConfig *testutils.TestConfig
 
 	keepClusterOnFailure = env.GetEnvBool("E2E_KEEP_CLUSTER_ON_FAILURE", false, ginkgo.GinkgoLogr)
-	printCoordinatorLogs = env.GetEnvBool("E2E_PRINT_COORDINATOR_LOGS", false, ginkgo.GinkgoLogr)
+	printLogs            = env.GetEnvBool("E2E_PRINT_LOGS", false, ginkgo.GinkgoLogr)
 
 	containerRuntime = env.GetEnvString("CONTAINER_RUNTIME", "docker", ginkgo.GinkgoLogr)
 	eppImage         = env.GetEnvString("EPP_IMAGE", "ghcr.io/llm-d/llm-d-router-endpoint-picker:dev", ginkgo.GinkgoLogr)
@@ -96,6 +96,7 @@ var (
 
 	portForwardSessions []*gexec.Session
 	rendererObjects     []string
+	stableInfraObjects  []string
 	createdNameSpace    bool
 )
 
@@ -128,6 +129,10 @@ var _ = ginkgo.BeforeSuite(func() {
 	}
 
 	rendererObjects = createRenderer()
+
+	// Coordinator and EPP Services/RBAC are created once and kept stable across
+	// specs (see createStableInfra).
+	createStableInfra()
 })
 
 var _ = ginkgo.ReportAfterSuite("cleanup", func(report ginkgo.Report) {
@@ -144,6 +149,9 @@ var _ = ginkgo.ReportAfterSuite("cleanup", func(report ginkgo.Report) {
 	nsName := getNamespace()
 	if len(rendererObjects) > 0 {
 		testutils.DeleteObjects(testConfig, rendererObjects, nsName)
+	}
+	if len(stableInfraObjects) > 0 {
+		testutils.DeleteObjects(testConfig, stableInfraObjects, nsName)
 	}
 	for _, session := range portForwardSessions {
 		session.Terminate()

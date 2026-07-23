@@ -226,9 +226,12 @@ each EPP call is single-phase scheduling.
 | `encode` | `encode` | Load-balances across encoder pods. |
 
 Each profile filters the shared pod pool down to its own role with a `by-label` role
-filter (`encode-filter`/`prefill-filter`/`decode-filter`); see
-[deploy/config/sim-e-p-d-epp-config.yaml](../deploy/config/sim-e-p-d-epp-config.yaml) for
-a full example configuration.
+filter (`encode-filter`/`prefill-filter`/`decode-filter`), the same
+`schedulingProfiles`/role-filter pattern used in
+[deploy/config/sim-e-p-d-epp-config.yaml](../deploy/config/sim-e-p-d-epp-config.yaml).
+That file targets the sidecar model, though, so it picks profiles via
+`disagg-profile-handler` deciders rather than the `EPP-Phase` header; header-based
+selection swaps in `header-phase-profile-handler` for that one plugin.
 
 This is an alternative to the sidecar-based orchestration in llm-d-router; see
 [Coordinator vs. the llm-d-router sidecar model](#coordinator-vs-the-llm-d-router-sidecar-model)

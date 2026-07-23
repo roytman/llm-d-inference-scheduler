@@ -82,10 +82,9 @@ func TestHeaderPhaseProfileHandlerFactory(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var decoder *json.Decoder
-			if tt.rawParameters != "" {
-				decoder = json.NewDecoder(strings.NewReader(tt.rawParameters))
-			}
+			// StrictDecoder is what the framework actually passes to factories
+			// (DisallowUnknownFields), so use it here too rather than a plain decoder.
+			decoder := fwkplugin.StrictDecoder(json.RawMessage(tt.rawParameters))
 
 			plugin, err := Factory("custom-name", decoder, nil)
 			if err != nil {

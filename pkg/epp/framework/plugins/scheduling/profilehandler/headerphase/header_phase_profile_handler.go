@@ -55,7 +55,7 @@ func Factory(name string, rawParameters *json.Decoder, _ fwkplugin.Handle) (fwkp
 		}
 	}
 
-	headerName := params.HeaderName
+	headerName := strings.TrimSpace(params.HeaderName)
 	if headerName == "" {
 		headerName = defaultHeaderName
 	}

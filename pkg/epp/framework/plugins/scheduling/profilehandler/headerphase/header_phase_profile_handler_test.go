@@ -73,6 +73,11 @@ func TestHeaderPhaseProfileHandlerFactory(t *testing.T) {
 			rawParameters:  `{"headerName": "  X-Custom-Phase  "}`,
 			wantHeaderName: "x-custom-phase",
 		},
+		{
+			name:           "whitespace-only header name falls back to the default",
+			rawParameters:  `{"headerName": "   "}`,
+			wantHeaderName: ingestedHeaderKey,
+		},
 	}
 
 	for _, tt := range tests {

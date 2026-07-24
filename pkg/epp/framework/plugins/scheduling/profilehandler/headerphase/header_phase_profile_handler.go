@@ -20,11 +20,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"strings"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	logging "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
+	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 )
 
@@ -38,10 +41,25 @@ const (
 	// defaultProfileName is the scheduling profile run when parameters.DefaultProfile is
 	// empty.
 	defaultProfileName = "decode"
+
+	// phaseSeparator delimits multiple profile names in the phase header, enabling
+	// non-deferred scheduling: the caller names every phase it wants co-scheduled in one
+	// call instead of one call per phase. Not configurable.
+	phaseSeparator = ","
+
+	// secondaryEndpointHeaderPrefix and secondaryEndpointHeaderSuffix bracket the
+	// profile name in the response header PreRequest writes for each non-primary
+	// profile a non-deferred request selected, e.g. "prefill" becomes
+	// "x-prefill-host-port".
+	secondaryEndpointHeaderPrefix = "x-"
+	secondaryEndpointHeaderSuffix = "-host-port"
 )
 
-// compile-time type assertion
-var _ fwksched.ProfileHandler = &HeaderPhaseProfileHandler{}
+// compile-time type assertions
+var (
+	_ fwksched.ProfileHandler = &HeaderPhaseProfileHandler{}
+	_ fwkrc.PreRequest        = &HeaderPhaseProfileHandler{}
+)
 
 // parameters configures the HeaderPhaseProfileHandler.
 type parameters struct {
@@ -96,11 +114,17 @@ func NewHeaderPhaseProfileHandler(headerName, defaultProfile string) *HeaderPhas
 	}
 }
 
-// HeaderPhaseProfileHandler runs exactly one scheduling profile per request: the one
-// named by the value of a request header. This lets a single EPP instance serve several
-// phases of a disaggregated pipeline (e.g. encode, prefill, decode) whose caller already
-// knows, out of band, which phase each request is for - unlike the disagg profile
-// handler, which decides which profiles to run via decider plugins.
+// HeaderPhaseProfileHandler runs one or more scheduling profiles per request, named by
+// the value of a request header, letting a single EPP instance serve several phases of
+// a disaggregated pipeline (e.g. encode, prefill, decode) whose caller already knows,
+// out of band, which phase(s) each request is for - unlike the disagg profile handler,
+// which decides which profiles to run via decider plugins.
+//
+// The header names one profile in the common (deferred) case, or several separated by
+// phaseSeparator for non-deferred scheduling: every named profile runs in this one
+// scheduling cycle, the first is primary (the destination the gateway actually routes
+// the connection to), and PreRequest stamps the others' selected endpoints onto response
+// headers instead, mirroring disagg-profile-handler's PreRequest for the sidecar model.
 //
 // Two fallbacks keep single-stage and header-less traffic working without a different
 // profile handler: with exactly one configured profile there is nothing to disaggregate,
@@ -135,6 +159,25 @@ func (h *HeaderPhaseProfileHandler) phaseHeader(request *fwksched.InferenceReque
 	return strings.TrimSpace(request.Headers[h.headerName])
 }
 
+// phaseList splits the phase header on phaseSeparator into trimmed, non-empty tokens,
+// in the order given. A single-value header (the common, deferred case) yields a
+// one-element list; a missing, blank, or all-separators header yields an empty list.
+func (h *HeaderPhaseProfileHandler) phaseList(request *fwksched.InferenceRequest) []string {
+	raw := h.phaseHeader(request)
+	if raw == "" {
+		return nil
+	}
+	tokens := strings.Split(raw, phaseSeparator)
+	phases := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		token = strings.TrimSpace(token)
+		if token != "" {
+			phases = append(phases, token)
+		}
+	}
+	return phases
+}
+
 // noMatchError explains why no configured scheduling profile matches phase, the
 // already-trimmed value of the phase header.
 func (h *HeaderPhaseProfileHandler) noMatchError(phase string) error {
@@ -144,23 +187,25 @@ func (h *HeaderPhaseProfileHandler) noMatchError(phase string) error {
 	return fmt.Errorf("header-phase profile handler: no scheduling profile configured for %q header value %q", h.headerName, phase)
 }
 
-// Pick selects the single SchedulingProfile to run: the only configured profile when
-// there is just one, otherwise the one named by the request's phase header, falling
-// back to defaultProfile when the header is missing or blank. It returns an empty map
-// once that profile has run, or when no profile could be resolved. In the latter case
-// the scheduler's run loop (pkg/epp/scheduling.Scheduler.Schedule) stops without ever
-// calling ProcessResults, so the specific reason is logged here rather than returned
-// from ProcessResults, where it would be unreachable. The client never sees that
-// reason: it only gets the scheduler's generic "failed to run any scheduler profile"
-// error, which pkg/epp/requestcontrol/director.go maps to a 429 ResourceExhausted
-// response - misleading, since a malformed or missing header is a client error, not a
-// capacity problem. Surfacing the real reason to the client needs a
-// scheduler/ProfileHandler contract change and is out of scope here; the log is a
-// diagnostic aid for operators, not an equivalent substitute for what the caller
-// receives.
+// Pick selects the SchedulingProfiles to run in this cycle: the only configured profile
+// when there is just one, otherwise every profile named by the request's phase header
+// (comma-separated for non-deferred scheduling), falling back to a single defaultProfile
+// when the header is missing or blank. The first named phase is primary; any further
+// phases are secondary and only need to be configured to run, not to exist for
+// defaultProfile purposes. It returns an empty map once the selected profiles have run,
+// or when the primary phase could not be resolved. In the latter case the scheduler's
+// run loop (pkg/epp/scheduling.Scheduler.Schedule) stops without ever calling
+// ProcessResults, so the specific reason is logged here rather than returned from
+// ProcessResults, where it would be unreachable. The client never sees that reason: it
+// only gets the scheduler's generic "failed to run any scheduler profile" error, which
+// pkg/epp/requestcontrol/director.go maps to a 429 ResourceExhausted response -
+// misleading, since a malformed or missing header is a client error, not a capacity
+// problem. Surfacing the real reason to the client needs a scheduler/ProfileHandler
+// contract change and is out of scope here; the log is a diagnostic aid for operators,
+// not an equivalent substitute for what the caller receives.
 func (h *HeaderPhaseProfileHandler) Pick(ctx context.Context, request *fwksched.InferenceRequest, profiles map[string]fwksched.SchedulerProfile,
 	profileResults map[string]*fwksched.ProfileRunResult) map[string]fwksched.SchedulerProfile {
-	if len(profileResults) > 0 { // the selected profile has already run
+	if len(profileResults) > 0 { // the selected profiles have already run
 		return map[string]fwksched.SchedulerProfile{}
 	}
 
@@ -173,46 +218,112 @@ func (h *HeaderPhaseProfileHandler) Pick(ctx context.Context, request *fwksched.
 		}
 	}
 
-	phase := h.phaseHeader(request)
-	resolvedPhase := phase
-	if resolvedPhase == "" {
-		resolvedPhase = h.defaultProfile
+	originalPhases := h.phaseList(request)
+	phases := originalPhases
+	if len(phases) == 0 {
+		phases = []string{h.defaultProfile}
 	}
 
-	profile, ok := profiles[resolvedPhase]
+	primaryProfile, ok := profiles[phases[0]]
 	if !ok {
-		log.FromContext(ctx).Error(h.noMatchError(phase), "no scheduling profile selected for request")
+		var reportPhase string
+		if len(originalPhases) > 0 {
+			reportPhase = originalPhases[0]
+		}
+		log.FromContext(ctx).Error(h.noMatchError(reportPhase), "no scheduling profile selected for request")
 		return map[string]fwksched.SchedulerProfile{}
 	}
 
-	return map[string]fwksched.SchedulerProfile{resolvedPhase: profile}
+	selected := map[string]fwksched.SchedulerProfile{phases[0]: primaryProfile}
+	for _, phase := range phases[1:] {
+		profile, ok := profiles[phase]
+		if !ok {
+			log.FromContext(ctx).V(logging.DEBUG).Info("secondary scheduling profile not configured, skipping", "phase", phase)
+			continue
+		}
+		selected[phase] = profile
+	}
+
+	return selected
 }
 
-// ProcessResults handles the outcome of the single profile run selected by Pick.
-// It specifies in the SchedulingResult the key of the primary profile that should be
-// used to get the request's selected destination.
+// primaryProfileName returns the key in profileResults that should be primary: the sole
+// result when there is only one (covers both the single-configured-profile shortcut and
+// an ordinary single-value header), otherwise the first phase in the header's list that
+// actually ran (the non-deferred, comma-separated case). len(profileResults) > 1 can only
+// happen via that comma-separated path - defaultProfile substitution always yields
+// exactly one phase - so re-deriving the phase list here is consistent with what Pick
+// used to select these results.
+func (h *HeaderPhaseProfileHandler) primaryProfileName(request *fwksched.InferenceRequest, profileResults map[string]*fwksched.ProfileRunResult) string {
+	if len(profileResults) == 1 {
+		for name := range profileResults {
+			return name
+		}
+	}
+	for _, phase := range h.phaseList(request) {
+		if _, ran := profileResults[phase]; ran {
+			return phase
+		}
+	}
+	return ""
+}
+
+// ProcessResults handles the outcome of the profile(s) selected by Pick. It specifies in
+// the SchedulingResult the key of the primary profile - the destination the gateway
+// routes the connection to - among possibly several profiles run for non-deferred
+// scheduling.
 func (h *HeaderPhaseProfileHandler) ProcessResults(_ context.Context, request *fwksched.InferenceRequest,
 	profileResults map[string]*fwksched.ProfileRunResult) (*fwksched.SchedulingResult, error) {
-	switch len(profileResults) {
-	case 0:
+	if len(profileResults) == 0 {
 		return nil, h.noMatchError(h.phaseHeader(request))
-	case 1:
-		// exactly one profile ran, handled below
-	default:
-		return nil, fmt.Errorf("header-phase profile handler is intended to run a single profile per request, got %d", len(profileResults))
 	}
 
-	var profileName string
-	for name := range profileResults {
-		profileName = name
+	primaryName := h.primaryProfileName(request, profileResults)
+	if primaryName == "" {
+		return nil, fmt.Errorf("header-phase profile handler: could not determine a primary profile among %d results", len(profileResults))
 	}
 
-	if profileResults[profileName] == nil { // there was an error while running the profile
-		return nil, fmt.Errorf("failed to run scheduler profile '%s'", profileName)
+	if profileResults[primaryName] == nil { // there was an error while running the profile
+		return nil, fmt.Errorf("failed to run scheduler profile '%s'", primaryName)
 	}
 
 	return &fwksched.SchedulingResult{
 		ProfileResults:     profileResults,
-		PrimaryProfileName: profileName,
+		PrimaryProfileName: primaryName,
 	}, nil
+}
+
+// secondaryEndpointHeader names the response header PreRequest writes with the selected
+// endpoints of a non-primary profile, e.g. "prefill" becomes "x-prefill-host-port".
+func secondaryEndpointHeader(profileName string) string {
+	return secondaryEndpointHeaderPrefix + profileName + secondaryEndpointHeaderSuffix
+}
+
+// PreRequest stamps each non-primary profile's selected endpoints onto a response header
+// named after that profile, so a caller that named several phases in one non-deferred
+// request can still reach the secondary phases' destinations - mirroring how
+// disagg-profile-handler's PreRequest stamps the fixed x-prefiller-host-port /
+// x-encoder-hosts-ports headers for its sidecar model. The primary profile's endpoint is
+// unaffected: it's the destination the gateway already routes the connection to.
+func (h *HeaderPhaseProfileHandler) PreRequest(_ context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult) {
+	if request == nil || schedulingResult == nil {
+		return
+	}
+	for name, result := range schedulingResult.ProfileResults {
+		if name == schedulingResult.PrimaryProfileName || result == nil {
+			continue
+		}
+		headerName := secondaryEndpointHeader(name)
+		delete(request.Headers, headerName)
+
+		hostPorts := make([]string, 0, len(result.TargetEndpoints))
+		for _, endpoint := range result.TargetEndpoints {
+			meta := endpoint.GetMetadata()
+			hostPorts = append(hostPorts, net.JoinHostPort(meta.Address, meta.Port))
+		}
+		if len(hostPorts) == 0 {
+			continue
+		}
+		request.Headers[headerName] = strings.Join(hostPorts, ",")
+	}
 }

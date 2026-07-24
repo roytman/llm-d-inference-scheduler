@@ -19,11 +19,13 @@ package headerphase
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 )
@@ -296,6 +298,43 @@ func TestHeaderPhasePick(t *testing.T) {
 			profileResults: map[string]*fwksched.ProfileRunResult{},
 			wantProfiles:   map[string]fwksched.SchedulerProfile{"decode": decodeProfile},
 		},
+		{
+			// Non-deferred: a comma-separated header runs every named phase in this
+			// one Pick call, not one call per phase.
+			name:           "comma-separated header runs every named profile",
+			request:        &fwksched.InferenceRequest{Headers: map[string]string{ingestedHeaderKey: "encode,decode"}},
+			profiles:       profiles,
+			profileResults: map[string]*fwksched.ProfileRunResult{},
+			wantProfiles:   map[string]fwksched.SchedulerProfile{"encode": encodeProfile, "decode": decodeProfile},
+		},
+		{
+			// Whitespace around and between comma-separated values is tolerated, same
+			// as the single-value case.
+			name:           "comma-separated header tolerates surrounding whitespace",
+			request:        &fwksched.InferenceRequest{Headers: map[string]string{ingestedHeaderKey: " encode , decode "}},
+			profiles:       profiles,
+			profileResults: map[string]*fwksched.ProfileRunResult{},
+			wantProfiles:   map[string]fwksched.SchedulerProfile{"encode": encodeProfile, "decode": decodeProfile},
+		},
+		{
+			// A secondary phase that isn't configured is skipped, but the primary
+			// still runs: an unconfigured secondary is not treated as fatal, unlike
+			// an unconfigured primary.
+			name:           "comma-separated header skips an unconfigured secondary profile",
+			request:        &fwksched.InferenceRequest{Headers: map[string]string{ingestedHeaderKey: "encode,prefill"}},
+			profiles:       profiles,
+			profileResults: map[string]*fwksched.ProfileRunResult{},
+			wantProfiles:   map[string]fwksched.SchedulerProfile{"encode": encodeProfile},
+		},
+		{
+			// An unconfigured primary phase still fails the whole request, even when
+			// a later phase in the list is configured.
+			name:           "comma-separated header still fails when the primary profile is unconfigured",
+			request:        &fwksched.InferenceRequest{Headers: map[string]string{ingestedHeaderKey: "prefill,encode"}},
+			profiles:       profiles,
+			profileResults: map[string]*fwksched.ProfileRunResult{},
+			wantProfiles:   map[string]fwksched.SchedulerProfile{},
+		},
 	}
 
 	handler := NewHeaderPhaseProfileHandler(defaultHeaderName, defaultProfileName)
@@ -432,13 +471,21 @@ func TestHeaderPhaseProcessResults(t *testing.T) {
 			wantErrContains: `no scheduling profile configured for "epp-phase" header value "prefill"`,
 		},
 		{
-			name: "multiple profiles returns error",
+			// Non-deferred: both ran under a "encode,decode" header, so the first named
+			// phase (encode) is primary even though map iteration order is unspecified.
+			name:    "multiple profiles from a comma-separated header, first phase is primary",
+			request: &fwksched.InferenceRequest{Headers: map[string]string{ingestedHeaderKey: "encode,decode"}},
 			profileResults: map[string]*fwksched.ProfileRunResult{
 				"encode": successResult,
 				"decode": successResult,
 			},
-			wantErr:         true,
-			wantErrContains: "is intended to run a single profile per request, got 2",
+			wantResult: &fwksched.SchedulingResult{
+				ProfileResults: map[string]*fwksched.ProfileRunResult{
+					"encode": successResult,
+					"decode": successResult,
+				},
+				PrimaryProfileName: "encode",
+			},
 		},
 		{
 			name: "nil result (profile execution failure) returns error",
@@ -447,6 +494,19 @@ func TestHeaderPhaseProcessResults(t *testing.T) {
 			},
 			wantErr:         true,
 			wantErrContains: "failed to run scheduler profile 'encode'",
+		},
+		{
+			// Defensive: profileResults' keys should always be a subset of the header's
+			// phase list, since Pick is what selected them, but if that invariant is
+			// ever violated, this must fail loudly rather than guess a primary.
+			name:    "multiple results that don't match the header's phase list, no primary determinable",
+			request: &fwksched.InferenceRequest{Headers: map[string]string{ingestedHeaderKey: "prefill,decode"}},
+			profileResults: map[string]*fwksched.ProfileRunResult{
+				"encode": successResult,
+				"foo":    successResult,
+			},
+			wantErr:         true,
+			wantErrContains: "could not determine a primary profile among 2 results",
 		},
 	}
 
@@ -474,4 +534,104 @@ func TestHeaderPhaseProcessResults(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHeaderPhasePhaseList(t *testing.T) {
+	handler := NewHeaderPhaseProfileHandler(defaultHeaderName, defaultProfileName)
+
+	tests := []struct {
+		name    string
+		request *fwksched.InferenceRequest
+		want    []string
+	}{
+		{name: "nil request", request: nil, want: nil},
+		{name: "missing header", request: &fwksched.InferenceRequest{Headers: map[string]string{}}, want: nil},
+		{
+			name:    "single value",
+			request: &fwksched.InferenceRequest{Headers: map[string]string{ingestedHeaderKey: "decode"}},
+			want:    []string{"decode"},
+		},
+		{
+			name:    "multiple values",
+			request: &fwksched.InferenceRequest{Headers: map[string]string{ingestedHeaderKey: "encode,prefill,decode"}},
+			want:    []string{"encode", "prefill", "decode"},
+		},
+		{
+			name:    "whitespace and empty tokens are dropped",
+			request: &fwksched.InferenceRequest{Headers: map[string]string{ingestedHeaderKey: " encode ,, decode "}},
+			want:    []string{"encode", "decode"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := handler.phaseList(tt.request)
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("phaseList() (-want +got): %s", diff)
+			}
+		})
+	}
+}
+
+func testEndpoint(address, port string) fwksched.Endpoint {
+	return fwksched.NewEndpoint(&fwkdl.EndpointMetadata{Address: address, Port: port}, nil, nil)
+}
+
+func TestHeaderPhasePreRequest(t *testing.T) {
+	handler := NewHeaderPhaseProfileHandler(defaultHeaderName, defaultProfileName)
+
+	t.Run("nil request is a no-op", func(t *testing.T) {
+		handler.PreRequest(context.Background(), nil, &fwksched.SchedulingResult{})
+	})
+
+	t.Run("nil schedulingResult is a no-op", func(t *testing.T) {
+		request := &fwksched.InferenceRequest{Headers: map[string]string{}}
+		handler.PreRequest(context.Background(), request, nil)
+		if len(request.Headers) != 0 {
+			t.Errorf("expected no headers to be set, got %v", request.Headers)
+		}
+	})
+
+	t.Run("stamps a header per secondary profile, skips the primary", func(t *testing.T) {
+		request := &fwksched.InferenceRequest{Headers: map[string]string{}}
+		result := &fwksched.SchedulingResult{
+			PrimaryProfileName: "encode",
+			ProfileResults: map[string]*fwksched.ProfileRunResult{
+				"encode":  {TargetEndpoints: []fwksched.Endpoint{testEndpoint("10.0.0.1", "8000")}},
+				"prefill": {TargetEndpoints: []fwksched.Endpoint{testEndpoint("10.0.0.2", "8001")}},
+				"decode":  {TargetEndpoints: []fwksched.Endpoint{testEndpoint("10.0.0.3", "8002"), testEndpoint("10.0.0.4", "8003")}},
+			},
+		}
+
+		handler.PreRequest(context.Background(), request, result)
+
+		if _, ok := request.Headers[secondaryEndpointHeader("encode")]; ok {
+			t.Errorf("did not expect a header for the primary profile, got %q", request.Headers[secondaryEndpointHeader("encode")])
+		}
+		if want, got := net.JoinHostPort("10.0.0.2", "8001"), request.Headers[secondaryEndpointHeader("prefill")]; got != want {
+			t.Errorf("prefill header = %q, want %q", got, want)
+		}
+		want := net.JoinHostPort("10.0.0.3", "8002") + "," + net.JoinHostPort("10.0.0.4", "8003")
+		if got := request.Headers[secondaryEndpointHeader("decode")]; got != want {
+			t.Errorf("decode header = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("skips a nil or empty secondary result", func(t *testing.T) {
+		request := &fwksched.InferenceRequest{Headers: map[string]string{}}
+		result := &fwksched.SchedulingResult{
+			PrimaryProfileName: "encode",
+			ProfileResults: map[string]*fwksched.ProfileRunResult{
+				"encode":  {TargetEndpoints: []fwksched.Endpoint{testEndpoint("10.0.0.1", "8000")}},
+				"prefill": nil,
+				"decode":  {TargetEndpoints: nil},
+			},
+		}
+
+		handler.PreRequest(context.Background(), request, result)
+
+		if len(request.Headers) != 0 {
+			t.Errorf("expected no headers to be set, got %v", request.Headers)
+		}
+	})
 }

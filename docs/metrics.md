@@ -551,7 +551,7 @@ fallback, consulted only when `--metrics-port` is unset.
 The endpoint serves plain HTTP by default. Pass `--metrics-cert-dir` with a
 directory containing `tls.crt` and `tls.key` to serve it over TLS instead.
 Missing or invalid files stop the sidecar; the metrics listener does not fall
-back to HTTP. The metrics TLS setting is independent of `--secure-proxy` and
+back to HTTP. The metrics TLS setting is independent of `--secure-serving` and
 `--cert-path`, which apply to the sidecar data-plane listener.
 
 | Full metric name | Type | Labels | Notes |
@@ -564,7 +564,7 @@ back to HTTP. The metrics TLS setting is independent of `--secure-proxy` and
 
 The legacy series listed here have been deprecated. Prefer the current `llm_d_epp_*` names in new
 dashboards and alerts. Series marked "no longer emitted" are removed; the table records their
-replacements so dashboards and alerts can be updated. The KV-cache rows remain dual-emitted.
+replacements so dashboards and alerts can be updated.
 
 | Legacy series | Current replacement | Notes |
 |---|---|---|
@@ -584,8 +584,8 @@ replacements so dashboards and alerts can be updated. The KV-cache rows remain d
 | `inference_extension_prefix_indexer_size` | `llm_d_epp_prefix_indexer_size` | Deprecated; no longer emitted. |
 | `inference_extension_prefix_indexer_hit_ratio` | `llm_d_epp_prefix_indexer_hit_ratio` | Deprecated; no longer emitted. |
 | `inference_extension_prefix_indexer_hit_bytes` | `llm_d_epp_prefix_indexer_hit_bytes` | Deprecated; no longer emitted. |
-| `kvcache_index_*` index series | `llm_d_epp_kv_cache_index_*` | Six index series are dual-emitted. |
-| `kvcache_kvevents_dedup_removed_hashes_suppressed_total`, `kvcache_kvevents_dedup_removed_hashes_forwarded_total` | Corresponding `llm_d_epp_kv_cache_events_*` series | These two KV-event series are dual-emitted. Other KV-event series are current-only. |
+| `kvcache_index_admissions_total`, `kvcache_index_evictions_total`, `kvcache_index_lookup_requests_total`, `kvcache_index_lookup_hits_total`, `kvcache_index_max_pod_hit_count_total`, `kvcache_index_lookup_latency_seconds` | `llm_d_epp_kv_cache_index_*` | Deprecated; no longer emitted. |
+| `kvcache_kvevents_dedup_removed_hashes_suppressed_total`, `kvcache_kvevents_dedup_removed_hashes_forwarded_total` | `llm_d_epp_kv_cache_events_dedup_removed_hashes_suppressed_total`, `llm_d_epp_kv_cache_events_dedup_removed_hashes_forwarded_total` | Deprecated; no longer emitted. |
 
 The historical `llm_d_router_epp_*` prefix is not emitted by the current Go code.
 

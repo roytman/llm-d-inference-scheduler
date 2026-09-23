@@ -69,7 +69,7 @@ type Options struct {
 	//
 	// ext_proc configuration.
 	//
-	GRPCPort              int           // gRPC port used for communicating with Envoy proxy. (TODO: uint16?)
+	GRPCPort              uint16        // gRPC port used for communicating with Envoy proxy.
 	EnableLeaderElection  bool          // Enables leader election for high availability
 	DrainTimeout          time.Duration // Graceful shutdown drain window; ext_proc keeps serving this long after SIGTERM.
 	GRPCMaxRecvMsgSize    int           // Maximum size of a gRPC message to receive (parsed bytes).
@@ -110,8 +110,8 @@ type Options struct {
 	logging.LoggingOptions           // Logging configuration.
 	Tracing                 bool     // Enables emitting traces.
 	HealthChecking          bool     // Enables health checking.
-	MetricsPort             int      // The metrics port exposed by EPP. (TODO: uint16)
-	GRPCHealthPort          int      // The port used for gRPC liveness and readiness probes. (TODO: uint16)
+	MetricsPort             uint16   // The metrics port exposed by EPP.
+	GRPCHealthPort          uint16   // The port used for gRPC liveness and readiness probes.
 	EnablePprof             bool     // Enables pprof handlers.
 	CertPath                string   // The path to the certificate for secure serving.
 	EnableCertReload        bool     // Enables certificate reloading of the certificates specified in --cert-path.
@@ -177,7 +177,7 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	}
 	opts.fs = fs
 
-	fs.IntVar(&opts.GRPCPort, "grpc-port", opts.GRPCPort, "gRPC port used for communicating with Envoy proxy.")
+	fs.Uint16Var(&opts.GRPCPort, "grpc-port", opts.GRPCPort, "gRPC port used for communicating with Envoy proxy.")
 	fs.BoolVar(&opts.EnableLeaderElection, "ha-enable-leader-election", opts.EnableLeaderElection,
 		"Enables leader election for high availability. When enabled, readiness probes will only pass on the leader.")
 	fs.DurationVar(&opts.DrainTimeout, "drain-timeout", opts.DrainTimeout,
@@ -230,15 +230,13 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 
 	fs.BoolVar(&opts.Tracing, "tracing", opts.Tracing, "Enables emitting traces.")
 	fs.BoolVar(&opts.HealthChecking, "health-checking", opts.HealthChecking, "Enables health checking.")
-	fs.IntVar(&opts.MetricsPort, "metrics-port", opts.MetricsPort, "The metrics port exposed by EPP.")
-	fs.IntVar(&opts.GRPCHealthPort, "grpc-health-port", opts.GRPCHealthPort,
+	fs.Uint16Var(&opts.MetricsPort, "metrics-port", opts.MetricsPort, "The metrics port exposed by EPP.")
+	fs.Uint16Var(&opts.GRPCHealthPort, "grpc-health-port", opts.GRPCHealthPort,
 		"The port used for gRPC liveness and readiness probes.")
 	fs.BoolVar(&opts.EnablePprof, "enable-pprof", opts.EnablePprof,
 		"Enables pprof handlers. Defaults to true. Set to false to disable pprof handlers.")
 	fs.StringVar(&opts.CertPath, "cert-path", opts.CertPath,
-		"The path to the certificate for secure serving. The certificate and private key files "+
-			"are assumed to be named tls.crt and tls.key, respectively. If not set, and secureServing is enabled, "+
-			"then a self-signed certificate is used.")
+		"Directory with tls.crt and tls.key for secure serving. Empty generates a self-signed certificate, which is only suitable for testing.")
 	fs.BoolVar(&opts.EnableCertReload, "enable-cert-reload", opts.EnableCertReload,
 		"Enables certificate reloading of the certificates specified in --cert-path.")
 	fs.BoolVar(&opts.EnableGRPCStreamMetrics, "enable-grpc-stream-metrics", opts.EnableGRPCStreamMetrics,
@@ -246,17 +244,17 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&opts.FairnessIDMetricLabelLimit, "fairness-id-metric-label-limit", opts.FairnessIDMetricLabelLimit,
 		"Caps the number of distinct fairness_id label values recorded on metrics; values beyond the cap collapse to a "+
 			"single overflow series, and 0 collapses all of them. Bounds metric cardinality with many distinct fairness IDs.")
-	fs.BoolVar(&opts.SecureServing, "secure-serving", opts.SecureServing, "Enables secure serving.")
+	fs.BoolVar(&opts.SecureServing, "secure-serving", opts.SecureServing, "Serve the listener over TLS.")
 	fs.StringVar(&opts.TLSMinVersion, "tls-min-version", opts.TLSMinVersion,
-		"Minimum TLS version for secure serving (e.g., VersionTLS12, VersionTLS13).")
+		"Minimum TLS version for secure serving (e.g., VersionTLS12, VersionTLS13). Empty uses VersionTLS12.")
 	fs.StringSliceVar(&opts.TLSCipherSuites, "tls-cipher-suites", opts.TLSCipherSuites,
-		"Comma-separated list of TLS cipher suites for secure serving (Go crypto/tls names, e.g., TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256). Only effective for TLS 1.2 and below; TLS 1.3 cipher suites are not configurable.")
+		"Comma-separated list of TLS cipher suites for secure serving (Go crypto/tls names, e.g., TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256). Empty uses the crypto/tls default. Only effective for TLS 1.2 and below; TLS 1.3 cipher suites are not configurable.")
 	fs.BoolVar(&opts.MetricsEndpointAuth, "metrics-endpoint-auth", opts.MetricsEndpointAuth,
 		"Enables authentication and authorization of the metrics endpoint.")
 	fs.StringVar(&opts.MetricsClientCAFile, "metrics-client-ca-file", opts.MetricsClientCAFile,
 		"PEM CA for metrics mTLS: require verified client certs.")
 	fs.StringVar(&opts.MetricsCertDir, "metrics-cert-dir", opts.MetricsCertDir,
-		"Directory with the metrics server certificates. Enables TLS on the metrics endpoint.")
+		"Directory with tls.crt and tls.key for the metrics endpoint. Empty serves metrics over plain HTTP. Independent of --secure-serving and --cert-path, which apply to the serving listener.")
 	fs.StringVar(&opts.ConfigFile, "config-file", opts.ConfigFile, "The path to the configuration file.")
 	fs.StringVar(&opts.ConfigText, "config-text", opts.ConfigText, "The configuration specified as text, in lieu of a file.")
 	fs.StringSliceVar(&opts.FeatureGates, "feature-gates", opts.FeatureGates,
@@ -351,7 +349,7 @@ func (opts *Options) Complete() error {
 var (
 	errMetricsClientCARequiresCertDir = errors.New(`"metrics-client-ca-file" requires "metrics-cert-dir"`)
 	errMetricsTLSWithoutAuth          = errors.New(`"metrics-cert-dir" enables metrics TLS without authentication; set "metrics-client-ca-file" or "metrics-endpoint-auth"`)
-	errMetricsCertUnreadable          = errors.New("metrics TLS cert file unreadable")
+	errMetricsCertUnreadable          = errors.New("metrics TLS: cert file unreadable")
 	errReadMetricsClientCA            = errors.New("reading metrics client CA")
 	errNoValidMetricsCA               = errors.New("no valid CA certs in metrics client CA file")
 )

@@ -24,10 +24,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -35,8 +37,10 @@ import (
 	"github.com/google/uuid"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	tlsutil "github.com/llm-d/llm-d-router/internal/tls"
 	"github.com/llm-d/llm-d-router/pkg/common"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 )
 
 // startHTTP starts the HTTP reverse proxy.
@@ -47,10 +51,14 @@ func (s *Server) startHTTP(ctx context.Context) error {
 		return err
 	}
 
-	ln, err := net.Listen("tcp", ":"+s.config.Port)
-	if err != nil {
-		s.logger.Error(err, "Failed to start")
-		return err
+	ln := s.HTTPListener
+	var err error
+	if ln == nil {
+		ln, err = net.Listen("tcp", ":"+s.config.Port)
+		if err != nil {
+			s.logger.Error(err, "Failed to start")
+			return err
+		}
 	}
 	s.addr = ln.Addr()
 	close(s.readyCh)
@@ -78,16 +86,16 @@ func (s *Server) startHTTP(ctx context.Context) error {
 	if s.config.SecureServing {
 		var tempCert tls.Certificate
 		if s.config.CertPath != "" {
-			certFile := s.config.CertPath + "/tls.crt"
-			keyFile := s.config.CertPath + "/tls.key"
+			certFile := filepath.Join(s.config.CertPath, "tls.crt")
+			keyFile := filepath.Join(s.config.CertPath, "tls.key")
 			tempCert, err = tls.LoadX509KeyPair(certFile, keyFile)
 			if err != nil {
-				return fmt.Errorf("failed to load TLS key pair from cert %q and key %q: %w", certFile, keyFile, err)
+				return fmt.Errorf("load key pair from cert %q and key %q: %w", certFile, keyFile, err)
 			}
 		} else {
-			tempCert, err = CreateSelfSignedTLSCertificate()
+			tempCert, err = tlsutil.CreateSelfSignedTLSCertificate(s.logger)
 			if err != nil {
-				return fmt.Errorf("failed to generate self-signed TLS certificate: %w", err)
+				return fmt.Errorf("create self-signed certificate: %w", err)
 			}
 		}
 		cert = &tempCert
@@ -100,7 +108,7 @@ func (s *Server) startHTTP(ctx context.Context) error {
 		if s.config.CertPath != "" {
 			reloader, err := common.NewCertReloader(ctx, s.config.CertPath, cert)
 			if err != nil {
-				return fmt.Errorf("failed to start reloader: %w", err)
+				return fmt.Errorf("start certificate reloader: %w", err)
 			}
 			getCertificate = func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
 				return reloader.Get(), nil
@@ -111,24 +119,15 @@ func (s *Server) startHTTP(ctx context.Context) error {
 		if minVersion == 0 {
 			minVersion = tls.VersionTLS12
 		}
-		cipherSuites := s.config.TLSCipherSuites
-		if len(cipherSuites) == 0 {
-			cipherSuites = []uint16{
-				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-			}
-		}
+		// An empty suite list leaves CipherSuites nil, which selects the
+		// crypto/tls default, matching the coordinator and EPP.
 		server.TLSConfig = &tls.Config{
 			MinVersion:     minVersion,
-			CipherSuites:   cipherSuites,
+			CipherSuites:   s.config.TLSCipherSuites,
 			GetCertificate: getCertificate,
 		}
-		s.logger.Info("server TLS configured")
 	}
+	s.logger.Info("server TLS", "tls", s.config.SecureServing, "cert_path", s.config.CertPath)
 
 	// Setup graceful termination (not strictly needed for sidecars)
 	go func() {
@@ -220,6 +219,7 @@ var inspectedRequestFields = map[string]struct{}{
 	requestFieldCacheHitThreshold:    {},
 	requestFieldContinueFinalMessage: {},
 	requestFieldAddGenerationPrompt:  {},
+	requestFieldBackground:           {},
 }
 
 // requestMessages returns the request's messages, decoding the array on first
@@ -276,7 +276,35 @@ func (s *Server) readJSONBody(r *http.Request, w http.ResponseWriter) ([]byte, m
 		}
 		return nil, nil, false
 	}
+	if r.URL.Path == reqcommon.PathResponses {
+		if err := rejectStatefulResponses(parsed); err != nil {
+			s.logger.V(logging.DEBUG).Info("rejecting unsupported responses field", "error", err)
+			if writeErr := errorJSONInvalid(err, w); writeErr != nil {
+				s.logger.Error(writeErr, "failed to send error response to client")
+			}
+			return nil, nil, false
+		}
+	}
 	return raw, parsed, true
+}
+
+// rejectStatefulResponses applies reqcommon.RejectStatefulResponsesFields to
+// the client's request. input is decoded into a shallow copy first: it stays a
+// json.RawMessage in parsed so that re-marshaling preserves the key order of
+// every input item (see inspectedRequestFields), but the helper walks it as a
+// []any to find a nested file_id. An input that does not decode leaves the
+// copy unmade, which costs only the file_id walk; the other fields are read
+// off parsed either way.
+func rejectStatefulResponses(parsed map[string]any) error {
+	checked := parsed
+	if raw, ok := parsed[requestFieldInput].(json.RawMessage); ok {
+		var decoded any
+		if err := json.Unmarshal(raw, &decoded); err == nil {
+			checked = maps.Clone(parsed)
+			checked[requestFieldInput] = decoded
+		}
+	}
+	return reqcommon.RejectStatefulResponsesFields(checked)
 }
 
 func cloneRequestWithBody(ctx context.Context, r *http.Request, body []byte) *http.Request {

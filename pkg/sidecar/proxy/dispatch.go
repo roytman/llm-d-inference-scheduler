@@ -200,6 +200,16 @@ func (s *Server) disaggregatedPrefillHandler(apiType reqcommon.APIType) http.Han
 		}
 
 		logger.V(logging.DEBUG).Info("no prefiller or encoder, using decoder only")
+		// dataParallelHandler and the plain decoder passthrough forward the
+		// body untouched, so a Responses request needs its stateful fields
+		// stripped here.
+		if apiType == reqcommon.APITypeResponses {
+			raw, _, ok := s.readJSONBody(r, w)
+			if !ok {
+				return
+			}
+			r = cloneRequestWithBody(r.Context(), r, raw)
+		}
 		if !s.forwardDataParallel || !s.dataParallelHandler(w, r) {
 			if kvCacheSource != "" {
 				s.decodeWithP2PSource(w, r, kvCacheSource)

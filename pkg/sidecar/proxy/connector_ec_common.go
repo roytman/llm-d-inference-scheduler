@@ -28,7 +28,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"maps"
 	"net/http"
 
 	"github.com/go-logr/logr"
@@ -37,12 +36,39 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// mmTypeInputImage is the Responses API's equivalent of image_url.
+const mmTypeInputImage = "input_image"
+
 // Multimodal content types that need encoder processing.
 var mmTypes = map[string]bool{
-	"image_url":   true,
-	"audio_url":   true,
-	"video_url":   true,
-	"input_audio": true,
+	"image_url":      true,
+	"audio_url":      true,
+	"video_url":      true,
+	"input_audio":    true,
+	mmTypeInputImage: true,
+}
+
+// requestInput returns the request's Responses input items, decoded the
+// same way requestMessages decodes messages. Responses' input may also be a
+// bare JSON string (a single text turn), which yields a nil slice and no
+// error, the same as an absent field.
+func requestInput(req map[string]any) ([]json.RawMessage, error) {
+	switch v := req[requestFieldInput].(type) {
+	case nil:
+		return nil, nil
+	case json.RawMessage:
+		var items []json.RawMessage
+		if err := json.Unmarshal(v, &items); err != nil {
+			var s string
+			if json.Unmarshal(v, &s) == nil {
+				return nil, nil
+			}
+			return nil, err
+		}
+		return items, nil
+	default:
+		return nil, fmt.Errorf("input is %T, want a JSON array or string", v)
+	}
 }
 
 // truncateLongStrings recursively shortens long string values for logging.
@@ -70,41 +96,58 @@ func truncateLongStrings(v any, maxLen int) any {
 	}
 }
 
-// extractMMItems extracts all multimodal items from the request messages.
-func extractMMItems(logger logr.Logger, requestData map[string]any) []map[string]any {
+// extractMMItems extracts all multimodal content parts from the request:
+// chat-completions' messages array, or a Responses input array. Which field
+// to walk is gated on apiType, not field presence: a client could send a
+// stray field the other format doesn't use, and presence-based sniffing
+// would process the wrong one.
+func extractMMItems(logger logr.Logger, requestData map[string]any, apiType reqcommon.APIType) []map[string]any {
 	var items []map[string]any
 
-	messages, err := requestMessages(requestData)
+	var wrapped []json.RawMessage
+	var err error
+	switch apiType {
+	case reqcommon.APITypeResponses:
+		wrapped, err = requestInput(requestData)
+	default:
+		wrapped, err = requestMessages(requestData)
+	}
 	if err != nil {
-		logger.V(logging.DEBUG).Info("cannot read request messages for multimodal extraction", "error", err)
+		logger.V(logging.DEBUG).Info("cannot read request content for multimodal extraction", "error", err)
 		return items
 	}
 
-	for _, msg := range messages {
-		var msgMap map[string]any
-		if err := json.Unmarshal(msg, &msgMap); err != nil {
+	for _, raw := range wrapped {
+		var itemMap map[string]any
+		if err := json.Unmarshal(raw, &itemMap); err != nil {
 			continue
 		}
 
-		content := msgMap["content"]
+		content := itemMap[requestFieldContent]
 		contentList, ok := content.([]any)
 		if !ok {
 			continue
 		}
 
-		for _, item := range contentList {
-			itemMap, ok := item.(map[string]any)
+		for _, part := range contentList {
+			partMap, ok := part.(map[string]any)
 			if !ok {
 				continue
 			}
 
-			itemType, ok := itemMap["type"].(string)
+			partType, ok := partMap["type"].(string)
 			if !ok {
 				continue
 			}
+			if partType == mmTypeInputImage && mmItemURL(partMap) == "" {
+				// A file_id-referenced image (no image_url string) has no
+				// content the encoder can fetch or receive inline.
+				logger.V(logging.DEBUG).Info("skipping input_image with no fetchable URL", "hasFileID", partMap["file_id"] != nil)
+				continue
+			}
 
-			if mmTypes[itemType] {
-				items = append(items, itemMap)
+			if mmTypes[partType] {
+				items = append(items, partMap)
 			}
 		}
 	}
@@ -112,32 +155,44 @@ func extractMMItems(logger logr.Logger, requestData map[string]any) []map[string
 	return items
 }
 
-// buildEncoderRequest creates a per-item encoder request: a one-level copy of
-// the client's request carrying only the multimodal item in messages[0].content
-// (text removed), capped to a single output token, and stream disabled.
-func buildEncoderRequest(originalRequest map[string]any, mmItem map[string]any) map[string]any {
-	encoderRequest := maps.Clone(originalRequest)
-
-	messages := []map[string]any{
-		{
-			"role": "user",
-			"content": []map[string]any{
-				mmItem,
-			},
-		},
+// buildEncoderRequest builds a per-item encoder request from scratch: model
+// plus a single synthetic message wrapping mmItem, capped to one output
+// token with streaming disabled. It does not copy the client's request: a
+// client field with an incompatible schema on the encoder's own API (e.g.
+// chat completions' tools) would otherwise reach it as-is. The encoder is
+// addressed as Responses when the original request is Responses, so a
+// Responses input_image part (bare-string URL, sibling detail field) is
+// forwarded unmodified rather than reshaped into chat completions'
+// image_url nesting, which vLLM's chat-completions engine ignores detail
+// on. A Responses encoder request sets store to false: vLLM defaults an
+// absent store to true, and nothing ever reads or reaps the response object
+// that a stored per-item priming request would leave behind.
+func buildEncoderRequest(originalRequest map[string]any, mmItem map[string]any, apiType reqcommon.APIType) map[string]any {
+	if apiType != reqcommon.APITypeResponses {
+		apiType = reqcommon.APITypeChatCompletions
 	}
 
-	encoderRequest["messages"] = messages
-	// The encoder request carries the item in messages and is sent to
-	// reqcommon.PathChatCompletions whatever API the client used (#2742), so it
-	// is capped as chat completions.
-	reqcommon.CapSingleToken(encoderRequest, reqcommon.APITypeChatCompletions)
+	encoderRequest := map[string]any{}
+	if model, ok := originalRequest[requestFieldModel]; ok {
+		encoderRequest[requestFieldModel] = model
+	}
+	message := map[string]any{"role": "user", "content": []map[string]any{mmItem}}
+	if apiType == reqcommon.APITypeResponses {
+		encoderRequest[requestFieldInput] = []map[string]any{message}
+		encoderRequest[requestFieldStore] = false
+	} else {
+		encoderRequest[requestFieldMessages] = []map[string]any{message}
+	}
+
+	reqcommon.CapSingleToken(encoderRequest, apiType)
 
 	return encoderRequest
 }
 
 // mmItemURL returns the URL string for a URL-based multimodal item, or
-// empty string when the item carries inline data instead.
+// empty string when the item carries inline data instead. A Responses
+// input_image item stores its URL as a bare string directly on the item,
+// unlike the other three types, which nest it under a same-named object.
 func mmItemURL(item map[string]any) string {
 	itemType, _ := item["type"].(string)
 	switch itemType {
@@ -147,17 +202,21 @@ func mmItemURL(item map[string]any) string {
 				return u
 			}
 		}
+	case mmTypeInputImage:
+		if u, ok := item["image_url"].(string); ok {
+			return u
+		}
 	}
 	return ""
 }
 
 // mmItemsForFanout extracts the multimodal items from a request body and
-// deduplicates URL-based items (image_url / audio_url / video_url). Non-URL
-// items (e.g. inline input_audio) are kept verbatim. Returns nil when
-// there is no multimodal content. The caller should skip the encoder
-// stage in that case.
-func (s *Server) mmItemsForFanout(originalRequest map[string]any, requestID string) []map[string]any {
-	raw := extractMMItems(s.logger, originalRequest)
+// deduplicates URL-based items (image_url / audio_url / video_url /
+// input_image). Non-URL items (e.g. inline input_audio) are kept verbatim.
+// Returns nil when there is no multimodal content. The caller should skip
+// the encoder stage in that case.
+func (s *Server) mmItemsForFanout(originalRequest map[string]any, requestID string, apiType reqcommon.APIType) []map[string]any {
+	raw := extractMMItems(s.logger, originalRequest, apiType)
 	if len(raw) == 0 {
 		return nil
 	}
@@ -192,10 +251,16 @@ func (s *Server) fanoutEncoder(
 	items []map[string]any,
 	encoderHostPorts []string,
 	requestID string,
+	apiType reqcommon.APIType,
 	perItem func(idx int, pw *bufferedResponseWriter) error,
 ) error {
 	if len(encoderHostPorts) == 0 {
 		return fmt.Errorf("fanoutEncoder: no encoder hostPorts provided (requestID=%s)", requestID)
+	}
+
+	encoderPath := reqcommon.PathChatCompletions
+	if apiType == reqcommon.APITypeResponses {
+		encoderPath = reqcommon.PathResponses
 	}
 
 	s.logger.Info("processing multimodal items", "count", len(items), "requestID", requestID, "encoderHostPorts", encoderHostPorts)
@@ -204,7 +269,7 @@ func (s *Server) fanoutEncoder(
 	for idx, mmItem := range items {
 		hostPort := encoderHostPorts[idx%len(encoderHostPorts)]
 		grp.Go(func() error {
-			encoderRequest := buildEncoderRequest(originalRequest, mmItem)
+			encoderRequest := buildEncoderRequest(originalRequest, mmItem, apiType)
 
 			body, err := json.Marshal(encoderRequest)
 			if err != nil {
@@ -220,7 +285,7 @@ func (s *Server) fanoutEncoder(
 				return err
 			}
 
-			req, err := http.NewRequestWithContext(gctx, "POST", reqcommon.PathChatCompletions, bytes.NewReader(body))
+			req, err := http.NewRequestWithContext(gctx, "POST", encoderPath, bytes.NewReader(body))
 			if err != nil {
 				err = fmt.Errorf("failed to create encoder request for item %d: %w", idx, err)
 				s.logger.Error(err, "encoder fanout", "item", idx, "requestID", requestID)

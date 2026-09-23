@@ -189,6 +189,56 @@ var _ = Describe("readJSONBody", func() {
 		Expect(ok).To(BeFalse())
 		Expect(*logged).ToNot(ContainElement(ContainSubstring("invalid request body")))
 	})
+
+	// The stateful-fields check is gated on the request path, not on which
+	// fields happen to be present, so this proves the gate itself: the same
+	// body is refused on the Responses path and forwarded elsewhere.
+	statefulBody := `{"model":"m","previous_response_id":"resp-123","conversation":"conv-123","store":true,"background":true}`
+
+	It("rejects unsupported Responses fields on the Responses path", func() {
+		w := httptest.NewRecorder()
+
+		_, _, ok := proxy.readJSONBody(httptest.NewRequest(http.MethodPost, reqcommon.PathResponses, bytes.NewReader([]byte(statefulBody))), w)
+
+		Expect(ok).To(BeFalse())
+		Expect(w.Code).To(Equal(http.StatusBadRequest))
+		Expect(w.Body.String()).To(ContainSubstring(reqcommon.FieldPreviousResponseID))
+	})
+
+	It("leaves those fields untouched on the chat-completions path", func() {
+		w := httptest.NewRecorder()
+
+		_, parsed, ok := proxy.readJSONBody(httptest.NewRequest(http.MethodPost, reqcommon.PathChatCompletions, bytes.NewReader([]byte(statefulBody))), w)
+
+		Expect(ok).To(BeTrue())
+		Expect(parsed).To(HaveKey(reqcommon.FieldPreviousResponseID))
+		Expect(parsed).To(HaveKey(reqcommon.FieldConversation))
+		Expect(parsed).To(HaveKey(reqcommon.FieldBackground))
+	})
+
+	// input stays a json.RawMessage in parsed, so these two cover
+	// rejectStatefulResponses decoding it into a shallow copy for the
+	// helper's file_id walk.
+	It("rejects a file_id nested in an input content part", func() {
+		w := httptest.NewRecorder()
+		body := `{"model":"m","input":[{"role":"user","content":[{"type":"input_image","file_id":"file-123"}]}]}`
+
+		_, _, ok := proxy.readJSONBody(httptest.NewRequest(http.MethodPost, reqcommon.PathResponses, bytes.NewReader([]byte(body))), w)
+
+		Expect(ok).To(BeFalse())
+		Expect(w.Code).To(Equal(http.StatusBadRequest))
+		Expect(w.Body.String()).To(ContainSubstring(reqcommon.FieldFileID))
+	})
+
+	It("forwards an input array with no file_id", func() {
+		w := httptest.NewRecorder()
+		body := `{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}`
+
+		_, parsed, ok := proxy.readJSONBody(httptest.NewRequest(http.MethodPost, reqcommon.PathResponses, bytes.NewReader([]byte(body))), w)
+
+		Expect(ok).To(BeTrue())
+		Expect(parsed).To(HaveKey(reqcommon.FieldInput))
+	})
 })
 
 // captureLogs points the proxy logger at the returned slice, keeping entries up
